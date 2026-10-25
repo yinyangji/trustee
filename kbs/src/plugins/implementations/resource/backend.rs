@@ -87,6 +87,14 @@ pub enum RepositoryConfig {
     #[serde(alias = "aliyun")]
     Aliyun(super::aliyun_kms::AliyunKmsBackendConfig),
 
+    #[cfg(feature = "aliyun")]
+    #[serde(alias = "aliyun_openapi")]
+    AliyunOpenApi(super::aliyun_openapi::AliyunOpenApiConfig),
+
+    #[cfg(feature = "aliyun")]
+    #[serde(alias = "aliyun_aap_public")]
+    AliyunAapPublic(super::aliyun_aap_public::AliyunAapPublicConfig),
+
     #[cfg(feature = "vault")]
     #[serde(alias = "vault")]
     Vault(vault_kv::VaultKvBackendConfig),
@@ -119,6 +127,20 @@ impl ResourceStorage {
             #[cfg(feature = "aliyun")]
             RepositoryConfig::Aliyun(config) => {
                 let client = super::aliyun_kms::AliyunKmsBackend::new(&config)?;
+                Ok(Self {
+                    backend: Arc::new(client),
+                })
+            }
+            #[cfg(feature = "aliyun")]
+            RepositoryConfig::AliyunOpenApi(config) => {
+                let client = super::aliyun_openapi::AliyunOpenApiBackend::new(config)?;
+                Ok(Self {
+                    backend: Arc::new(client),
+                })
+            }
+            #[cfg(feature = "aliyun")]
+            RepositoryConfig::AliyunAapPublic(config) => {
+                let client = super::aliyun_aap_public::AliyunAapPublicBackend::new(config)?;
                 Ok(Self {
                     backend: Arc::new(client),
                 })

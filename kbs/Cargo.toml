@@ -31,7 +31,7 @@ intel-trust-authority-as = ["as", "az-cvm-vtpm"]
 external-plugin = ["tonic", "tonic-prost", "prost", "backon", "rustls"]
 
 # Use aliyun KMS as KBS backend
-aliyun = ["kms/aliyun"]
+aliyun = ["kms/aliyun", "dep:p12"]
 
 # Use pkcs11 plugin
 pkcs11 = ["cryptoki"]
@@ -68,6 +68,7 @@ kbs-types.workspace = true
 key-value-storage.path = "../deps/key-value-storage"
 kms = { workspace = true, default-features = false }
 mobc = { workspace = true, optional = true }
+p12 = { version = "0.6.3", optional = true }
 p256 = { workspace = true, features = ["ecdh"] }
 p521 = { workspace = true, features = ["ecdh"] }
 zeroize.workspace = true
@@ -90,7 +91,7 @@ shadow-rs.workspace = true
 strum.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["serde"] }
+time = { workspace = true, features = ["serde", "parsing", "formatting"] }
 tokio.workspace = true
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }

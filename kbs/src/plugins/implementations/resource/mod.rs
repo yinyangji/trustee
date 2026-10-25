@@ -7,6 +7,12 @@ pub mod kv_storage;
 #[cfg(feature = "aliyun")]
 pub mod aliyun_kms;
 
+#[cfg(feature = "aliyun")]
+pub mod aliyun_openapi;
+
+#[cfg(feature = "aliyun")]
+pub mod aliyun_aap_public;
+
 #[cfg(feature = "vault")]
 pub mod vault_kv;
 

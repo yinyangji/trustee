@@ -3662,6 +3662,7 @@ dependencies = [
  "kms",
  "mobc",
  "openssl",
+ "p12",
  "p256",
  "p521",
  "policy-engine",
