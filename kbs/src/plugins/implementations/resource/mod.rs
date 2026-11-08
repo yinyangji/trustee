@@ -7,6 +7,9 @@ pub mod kv_storage;
 #[cfg(feature = "aliyun")]
 pub mod aliyun_kms;
 
+#[cfg(feature = "aliyun-enclave")]
+pub mod aliyun_enclave;
+
 #[cfg(feature = "aws")]
 pub mod aws_kms;
 

@@ -4,6 +4,7 @@ members = [
     "attestation-service",
     "rvps",
     "tools/kbs-client",
+    "tools/sgx-aap-wrap",
     "deps/verifier",
     "deps/eventlog",
     "integration-tests",

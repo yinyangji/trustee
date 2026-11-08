@@ -370,7 +370,7 @@ This is also called "Repository" in old versions. The properties to be configure
 
 | Property | Type   | Description                                                   | Required | Default    |
 |----------|--------|---------------------------------------------------------------|----------|------------|
-| `type`| String | Storage type for resources: `kvstorage`, `Aliyun`, `Aws`, `Gcp`, `Vault` | No       | `kvstorage`|
+| `type`| String | Storage type for resources: `kvstorage`, `Aliyun`, `AliyunEnclave`, `Aws`, `Gcp`, `Vault` | No       | `kvstorage`|
 
 When `storage_backend_type = "kvstorage"` (default), the resource plugin uses the unified [storage backend](#storage-backend-configuration) with namespace `repository`. Configure storage in the `[storage_backend]` section only.
 
@@ -382,6 +382,17 @@ When `storage_backend_type = "Aliyun"`:
 | `kms_instance_id` | String | The KMS instance id               | Yes      | `kst-shh668f7...`                                   |
 | `password`        | String | AAP client key password           | Yes      | `8f9989c18d27...`                                   |
 | `cert_pem`        | String | CA cert for the KMS instance      | Yes      | `-----BEGIN CERTIFICATE----- ...`                   |
+
+When `storage_backend_type = "AliyunEnclave"` (crate feature `aliyun-enclave`):
+
+KBS does not accept `client_key`, `password`, or `cert_pem`. Those stay sealed for the `sgx-aap-wrap` process. KBS generates a P-256 key, puts `SHA-384(SEC1 pubkey)` in the first 48 bytes of TDX `REPORTDATA`, reads the quote from configfs, and asks the wrap service for the secret. The wrap service returns the secret encrypted to that key.
+
+| Property          | Type   | Description                                      | Required | Example                          |
+|-------------------|--------|--------------------------------------------------|----------|----------------------------------|
+| `enclave_url`     | String | Base URL of `sgx-aap-wrap`                       | Yes      | `http://sgx-aap-wrap:8443`       |
+| `kms_instance_id` | String | KMS instance id bound into the sealed AAP blob   | Yes      | `kst-shh668f7...`                |
+
+`client_key` in this table is a config error. The KBS process still has to run inside a TDX guest: the quote is generated there, and the returned secret is decrypted there.
 
 When `storage_backend_type = "Aws"`:
 

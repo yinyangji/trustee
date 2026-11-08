@@ -4360,6 +4360,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serial_test",
+ "sgx-aap-wrap",
  "sha2 0.11.0",
  "sha3-kmac",
  "shadow-rs",
@@ -7032,6 +7033,28 @@ dependencies = [
  "serde_bytes",
  "static_assertions",
  "uuid",
+]
+
+[[package]]
+name = "sgx-aap-wrap"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "aes-gcm 0.11.1",
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "clap",
+ "kms",
+ "p256",
+ "rand_core 0.6.4",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]

@@ -30,6 +30,8 @@ One KBS can be configured with a specified KMS instance in `repository_config` f
 These materials can be found in KMS instance's [AAP](https://www.alibabacloud.com/help/en/kms/user-guide/manage-aaps?spm=a3c0i.23458820.2359477120.1.4fd96e9bmEFST4).
 When being accessed, a resource URI of `kbs:///repo/type/tag` will be translated into the generic secret with name `tag`. Hinting that `repo/type` field will be ignored.
 
+`storage_backend_type = "AliyunEnclave"` is the same resource mapping, but KBS does not load the AAP client key. `sgx-aap-wrap` unseals that key and calls KMS. This build's SGX seal and DCAP quote check refuse to run until those backends are linked; they do not fall back to plaintext.
+
 ### AWS Secrets Manager
 
 [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html)

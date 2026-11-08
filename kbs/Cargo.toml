@@ -38,6 +38,10 @@ external-plugin = ["tonic", "tonic-prost", "prost", "backon", "rustls"]
 # Use aliyun KMS as KBS backend
 aliyun = ["kms/aliyun"]
 
+# Fetch Aliyun secrets through the SGX AAP wrap service.
+# KBS config for this feature has no client_key.
+aliyun-enclave = ["dep:sgx-aap-wrap"]
+
 # Use pkcs11 plugin
 pkcs11 = ["cryptoki"]
 
@@ -110,6 +114,7 @@ serde_json.workspace = true
 serde_with.workspace = true
 sha2.workspace = true
 shadow-rs.workspace = true
+sgx-aap-wrap = { path = "../tools/sgx-aap-wrap", optional = true }
 strum.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

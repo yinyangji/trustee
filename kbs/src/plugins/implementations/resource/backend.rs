@@ -98,6 +98,11 @@ pub enum RepositoryConfig {
     #[serde(alias = "aliyun")]
     Aliyun(super::aliyun_kms::AliyunKmsBackendConfig),
 
+    /// AAP client key stays in the SGX wrap service. This variant rejects `client_key`.
+    #[cfg(feature = "aliyun-enclave")]
+    #[serde(rename = "AliyunEnclave", alias = "aliyun-enclave")]
+    AliyunEnclave(super::aliyun_enclave::AliyunEnclaveBackendConfig),
+
     #[cfg(feature = "aws")]
     #[serde(alias = "aws")]
     Aws(aws_kms::AwsKmsBackendConfig),
@@ -135,6 +140,13 @@ impl ResourceStorage {
             #[cfg(feature = "aliyun")]
             RepositoryConfig::Aliyun(config) => {
                 let client = super::aliyun_kms::AliyunKmsBackend::new(&config)?;
+                Ok(Self {
+                    backend: Arc::new(client),
+                })
+            }
+            #[cfg(feature = "aliyun-enclave")]
+            RepositoryConfig::AliyunEnclave(config) => {
+                let client = super::aliyun_enclave::AliyunEnclaveBackend::new(config)?;
                 Ok(Self {
                     backend: Arc::new(client),
                 })
