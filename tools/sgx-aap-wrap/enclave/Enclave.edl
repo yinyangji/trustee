@@ -1,0 +1,10 @@
+enclave {
+    from "sgx_tprotected_fs.edl" import *;
+
+    trusted {
+        public int ecall_create([in, string] const char* path, [in, count=len] const uint8_t* data, size_t len);
+        public int ecall_read([in, string] const char* path, [out, count=cap] uint8_t* buf, size_t cap, [out] size_t* out_len);
+        public int ecall_export_key([in, string] const char* path, [out, count=16] uint8_t* key);
+        public int ecall_import_key([in, string] const char* path, [in, count=16] const uint8_t* key);
+    };
+};

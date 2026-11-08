@@ -30,7 +30,11 @@ pub fn read_host_tdx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>> {
     let parent = PathBuf::from("/sys/kernel/config/tsm/report");
     let mut suffix = [0u8; 4];
     OsRng.fill_bytes(&mut suffix);
-    let dir = parent.join(format!("kbs-{}-{}", std::process::id(), u32::from_ne_bytes(suffix)));
+    let dir = parent.join(format!(
+        "kbs-{}-{}",
+        std::process::id(),
+        u32::from_ne_bytes(suffix)
+    ));
     fs::create_dir(&dir).context(
         "create TSM report directory; mount configfs at /sys/kernel/config and run with CAP_SYS_ADMIN",
     )?;

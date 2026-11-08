@@ -131,14 +131,8 @@ mod tests {
     fn encrypt_round_trip() {
         let kbs = generate_kbs_key();
         let enclave = generate_kbs_key();
-        let blob = encrypt_for(
-            &enclave,
-            &kbs.public_key(),
-            "kst-1",
-            "key.bin",
-            b"resource",
-        )
-        .unwrap();
+        let blob =
+            encrypt_for(&enclave, &kbs.public_key(), "kst-1", "key.bin", b"resource").unwrap();
         let plain = decrypt_from(&kbs, &enclave.public_key(), "kst-1", "key.bin", &blob).unwrap();
         assert_eq!(plain, b"resource");
         assert!(decrypt_from(&kbs, &enclave.public_key(), "kst-2", "key.bin", &blob).is_err());

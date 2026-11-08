@@ -2,7 +2,7 @@
 name = "sgx-aap-wrap"
 version.workspace = true
 authors.workspace = true
-description = "Unseal an Aliyun AAP client key inside SGX and return only the requested KMS secret"
+description = "Hold an Aliyun AAP client key in an SGX protected file and return only the requested KMS secret"
 edition.workspace = true
 
 [dependencies]
@@ -21,6 +21,7 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
+libc = "0.2"
 
 [features]
 # Link the guest-components Aliyun client into the wrap process.

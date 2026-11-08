@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{self, decode_pubkey, report_data};
 use crate::material::AapMaterial;
 use crate::quote::QuotePolicy;
-use crate::seal::AapSealer;
+use crate::store::AapStore;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct GetSecretRequest {
@@ -61,10 +61,10 @@ impl KmsGet for AliyunKmsOp {
 
 #[derive(Clone)]
 pub struct WrapState {
-    pub sealer: Arc<dyn AapSealer>,
+    pub store: Arc<dyn AapStore>,
     pub quotes: Arc<dyn QuotePolicy>,
     pub kms: Arc<dyn KmsGet>,
-    pub blob: Arc<Vec<u8>>,
+    pub file: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -88,17 +88,23 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-pub async fn release_secret(state: &WrapState, request: GetSecretRequest) -> Result<GetSecretResponse> {
+pub async fn release_secret(
+    state: &WrapState,
+    request: GetSecretRequest,
+) -> Result<GetSecretResponse> {
     let pubkey_bytes = crypto::b64_decode(&request.kbs_pubkey)?;
     let pubkey = decode_pubkey(&pubkey_bytes)?;
     let expected = report_data(&pubkey_bytes);
     let quote = crypto::b64_decode(&request.quote)?;
     state.quotes.verify(&quote, &expected)?;
-    let material = state.sealer.unseal(&state.blob)?;
+    let material = state.store.read(&state.file)?;
     if material.kms_instance_id != request.kms_instance_id {
         anyhow::bail!("sealed AAP credential is for a different KMS instance");
     }
-    let secret = state.kms.get_secret(&material, &request.secret_name).await?;
+    let secret = state
+        .kms
+        .get_secret(&material, &request.secret_name)
+        .await?;
     let enclave_key = crypto::generate_kbs_key();
     let encrypted = crypto::encrypt_for(
         &enclave_key,
@@ -158,7 +164,13 @@ pub async fn fetch_secret(
     let body: GetSecretResponse = response.json().await.context("AAP wrap response")?;
     let enclave_pubkey = decode_pubkey(&crypto::b64_decode(&body.enclave_pubkey)?)?;
     let encrypted = crypto::b64_decode(&body.encrypted_secret)?;
-    crypto::decrypt_from(kbs_secret, &enclave_pubkey, kms_instance_id, secret_name, &encrypted)
+    crypto::decrypt_from(
+        kbs_secret,
+        &enclave_pubkey,
+        kms_instance_id,
+        secret_name,
+        &encrypted,
+    )
 }
 
 #[cfg(test)]
@@ -167,7 +179,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::quote::{test_quote, TestQuotePolicy};
-    use crate::seal::DevSealer;
+    use crate::store::TestStore;
     use zeroize::Zeroizing;
 
     struct Fixture {
@@ -192,12 +204,15 @@ mod tests {
             cert_pem: "cert".to_string(),
             kms_instance_id: "kst-lab".to_string(),
         };
-        let blob = DevSealer::new([3u8; 32]).seal(&material).unwrap();
+        let store = Arc::new(TestStore::new());
+        store
+            .create(std::path::Path::new("aap-client.protected"), &material)
+            .unwrap();
         WrapState {
-            sealer: Arc::new(DevSealer::new([3u8; 32])),
+            store,
             quotes: Arc::new(TestQuotePolicy),
             kms: called,
-            blob: Arc::new(blob),
+            file: std::path::PathBuf::from("aap-client.protected"),
         }
     }
 
@@ -211,7 +226,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = HttpServer::new({
             let fixture = fixture.clone();
-            move || App::new().app_data(web::Data::new(state(fixture.clone()))).service(get_secret)
+            move || {
+                App::new()
+                    .app_data(web::Data::new(state(fixture.clone())))
+                    .service(get_secret)
+            }
         })
         .listen(listener)
         .unwrap()
@@ -221,9 +240,15 @@ mod tests {
         let kbs = crypto::generate_kbs_key();
         let pubkey = crypto::encode_pubkey(&kbs.public_key());
         let quote = test_quote(&report_data(&pubkey));
-        let secret = fetch_secret(&format!("http://{addr}"), "kst-lab", "key.bin", &quote, &kbs)
-            .await
-            .unwrap();
+        let secret = fetch_secret(
+            &format!("http://{addr}"),
+            "kst-lab",
+            "key.bin",
+            &quote,
+            &kbs,
+        )
+        .await
+        .unwrap();
         assert_eq!(secret, b"coco-lab-sample-resource");
         assert!(fixture.called.load(Ordering::SeqCst));
 
