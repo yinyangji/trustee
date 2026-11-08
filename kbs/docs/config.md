@@ -385,7 +385,7 @@ When `storage_backend_type = "Aliyun"`:
 
 When `storage_backend_type = "AliyunEnclave"` (crate feature `aliyun-enclave`):
 
-KBS does not accept `client_key`, `password`, or `cert_pem`. Those stay sealed for the `sgx-aap-wrap` process. KBS generates a P-256 key, puts `SHA-384(SEC1 pubkey)` in the first 48 bytes of TDX `REPORTDATA`, reads the quote from configfs, and asks the wrap service for the secret. The wrap service returns the secret encrypted to that key.
+KBS does not accept `client_key`, `password`, or `cert_pem`. The wrap enclave stores them with `sgx_fopen_auto_key` and `sgx_fwrite`. Backup and migration use `sgx_fexport_auto_key` / `sgx_fimport_auto_key`, not `sgx_seal_data`. See [AAP client key backup](aap-client-key-backup.md). KBS generates a P-256 key, puts `SHA-384(SEC1 pubkey)` in the first 48 bytes of TDX `REPORTDATA`, reads the quote from configfs, and asks the wrap service for the secret. The wrap service returns the secret encrypted to that key.
 
 | Property          | Type   | Description                                      | Required | Example                          |
 |-------------------|--------|--------------------------------------------------|----------|----------------------------------|
