@@ -55,6 +55,28 @@ pub fn material_from_json(bytes: &[u8]) -> anyhow::Result<AapMaterial> {
     Ok(file.into())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn material_json_round_trip_keeps_the_client_key_out_of_debug() {
+        let raw = br#"{"client_key":"CLIENT-KEY-SHOULD-NOT-LEAK","password":"pw","cert_pem":"cert","kms_instance_id":"kst-lab"}"#;
+        let material = material_from_json(raw).unwrap();
+        assert_eq!(material.client_key.as_str(), "CLIENT-KEY-SHOULD-NOT-LEAK");
+        assert_eq!(material.kms_instance_id, "kst-lab");
+        let encoded = serde_json::to_vec(&MaterialFile::from(&material)).unwrap();
+        assert_eq!(
+            material_from_json(&encoded).unwrap().password.as_str(),
+            "pw"
+        );
+        let debug = format!("{material:?}");
+        assert!(!debug.contains("CLIENT-KEY"));
+        assert!(debug.contains("kst-lab"));
+        assert!(material_from_json(br#"{"client_key":"x"}"#).is_err());
+    }
+}
+
 impl From<&AapMaterial> for MaterialFile {
     fn from(material: &AapMaterial) -> Self {
         Self {

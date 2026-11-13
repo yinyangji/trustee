@@ -38,6 +38,20 @@ pub trait KmsGet: Send + Sync {
     async fn get_secret(&self, material: &AapMaterial, name: &str) -> Result<Vec<u8>>;
 }
 
+/// Debug stand-in. It still requires the protected file to open, and it returns
+/// `mock:<secret name>` instead of calling Aliyun KMS.
+pub struct MockKms;
+
+#[async_trait]
+impl KmsGet for MockKms {
+    async fn get_secret(&self, material: &AapMaterial, name: &str) -> Result<Vec<u8>> {
+        if material.client_key.is_empty() {
+            anyhow::bail!("protected file has an empty client key");
+        }
+        Ok(format!("mock:{name}").into_bytes())
+    }
+}
+
 #[cfg(feature = "aliyun")]
 pub struct AliyunKmsOp;
 
@@ -268,6 +282,45 @@ mod tests {
                 .is_err()
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mock_kms_returns_the_name_without_the_client_key() {
+        let material = AapMaterial {
+            client_key: Zeroizing::new("CLIENT-KEY-SHOULD-NOT-LEAK".to_string()),
+            password: Zeroizing::new("pw".to_string()),
+            cert_pem: "cert".to_string(),
+            kms_instance_id: "kst-lab".to_string(),
+        };
+        let store = Arc::new(TestStore::new());
+        store
+            .create(std::path::Path::new("aap-client.protected"), &material)
+            .unwrap();
+        let kbs = crypto::generate_kbs_key();
+        let pubkey = crypto::encode_pubkey(&kbs.public_key());
+        let response = release_secret(
+            &WrapState {
+                store,
+                quotes: Arc::new(TestQuotePolicy),
+                kms: Arc::new(MockKms),
+                file: std::path::PathBuf::from("aap-client.protected"),
+            },
+            GetSecretRequest {
+                kms_instance_id: "kst-lab".into(),
+                secret_name: "key.bin".into(),
+                kbs_pubkey: crypto::b64_encode(&pubkey),
+                quote: crypto::b64_encode(&test_quote(&report_data(&pubkey))),
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = crypto::b64_decode(&response.encrypted_secret).unwrap();
+        let enclave_pubkey =
+            crypto::decode_pubkey(&crypto::b64_decode(&response.enclave_pubkey).unwrap()).unwrap();
+        let plain =
+            crypto::decrypt_from(&kbs, &enclave_pubkey, "kst-lab", "key.bin", &encrypted).unwrap();
+        assert_eq!(plain, b"mock:key.bin");
+        assert!(!plain.windows(10).any(|w| w == b"CLIENT-KEY"));
     }
 
     #[test]

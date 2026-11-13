@@ -60,7 +60,8 @@ impl TestStore {
 }
 
 #[cfg(test)]
-impl AapStore for TestStore {    fn create(&self, path: &Path, material: &AapMaterial) -> Result<()> {
+impl AapStore for TestStore {
+    fn create(&self, path: &Path, material: &AapMaterial) -> Result<()> {
         self.inner
             .lock()
             .unwrap()

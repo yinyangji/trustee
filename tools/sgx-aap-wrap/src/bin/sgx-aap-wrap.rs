@@ -10,8 +10,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use sgx_aap_wrap::{
-    material_from_json, open_quote_policy, serve, AapStore, KmsGet, SgxProtectedFs, WrapState,
-    FILE_KEY_LEN,
+    material_from_json, open_quote_policy, serve, AapStore, KmsGet, MockKms, SgxProtectedFs,
+    WrapState, FILE_KEY_LEN,
 };
 
 #[derive(Parser)]
@@ -49,8 +49,14 @@ enum Command {
     Serve {
         #[arg(long)]
         file: PathBuf,
-        #[arg(long, default_value = "dcap")]
+        /// `accept` takes the quote as-is. `dcap` verifies it. `test` expects
+        /// the `test-quote:` prefix used by unit tests.
+        #[arg(long, default_value = "accept")]
         quote_policy: String,
+        /// `mock` returns `mock:<secret name>` after the protected file opens.
+        /// `aliyun` calls KMS and requires a build with `--features aliyun`.
+        #[arg(long, default_value = "mock")]
+        kms: String,
         #[arg(long, default_value = "127.0.0.1:8443")]
         listen: String,
     },
@@ -89,18 +95,16 @@ async fn main() -> Result<()> {
         Command::Serve {
             file,
             quote_policy,
+            kms,
             listen,
         } => {
-            if quote_policy == "dcap" {
-                bail!("DCAP quote verification is not linked into this build; refusing to release secrets");
-            }
             let quotes = open_quote_policy(&quote_policy)?;
             serve(
                 &listen,
                 WrapState {
                     store: Arc::new(store),
                     quotes: quotes.into(),
-                    kms: aliyun_kms()?,
+                    kms: open_kms(&kms)?,
                     file,
                 },
             )
@@ -119,6 +123,14 @@ fn write_secret(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("create {}", path.display()))?;
     file.write_all(bytes)?;
     Ok(())
+}
+
+fn open_kms(kind: &str) -> Result<Arc<dyn KmsGet>> {
+    match kind {
+        "mock" => Ok(Arc::new(MockKms)),
+        "aliyun" => aliyun_kms(),
+        other => bail!("unknown kms backend {other}"),
+    }
 }
 
 fn aliyun_kms() -> Result<Arc<dyn KmsGet>> {

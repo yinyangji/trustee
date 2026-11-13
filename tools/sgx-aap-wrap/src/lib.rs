@@ -11,6 +11,10 @@
 //! The client key is stored with `sgx_fopen_auto_key`. `sgx_fexport_auto_key`
 //! exports the 128-bit file key for backup. `sgx_fimport_auto_key` opens that
 //! file on another CPU. `sgx_seal_data` is not used.
+//!
+//! The default quote policy accepts the bytes without verification. `dcap`
+//! checks the quote with `tee_verify_quote` and
+//! `sgx_tvl_verify_qve_report_and_identity`.
 
 mod crypto;
 mod material;
@@ -22,8 +26,12 @@ mod tdx;
 
 pub use crypto::{encode_pubkey, generate_kbs_key, report_data};
 pub use material::{material_from_json, AapMaterial, KbsAliyunEnclaveConfig};
-pub use quote::{open_quote_policy, DcapQuotePolicy, QuotePolicy, TestQuotePolicy};
-pub use server::{fetch_secret, serve, GetSecretRequest, GetSecretResponse, KmsGet, WrapState};
+pub use quote::{
+    open_quote_policy, AcceptQuotePolicy, DcapQuotePolicy, QuotePolicy, TestQuotePolicy,
+};
+pub use server::{
+    fetch_secret, serve, GetSecretRequest, GetSecretResponse, KmsGet, MockKms, WrapState,
+};
 pub use sgxfs::FILE_KEY_LEN;
 pub use store::{AapStore, SgxProtectedFs};
 pub use tdx::{exchange_report, read_host_tdx_quote};

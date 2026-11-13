@@ -19,7 +19,7 @@ LIB := $(SGX_SDK)/lib64
 ENCLAVE_LDFLAGS := -Wl,-z,relro,-z,now,-z,noexecstack \
     -Wl,--no-undefined -nostdlib -nodefaultlibs -nostartfiles -L$(LIB) \
     -Wl,--whole-archive -l$(TRTS) -Wl,--no-whole-archive \
-    -Wl,--start-group -lsgx_tstdc -lsgx_tcxx -lsgx_pthread -lsgx_tcrypto -lsgx_tprotected_fs -l$(SERVICE) -Wl,--end-group \
+    -Wl,--start-group -lsgx_dcap_tvl -lsgx_tstdc -lsgx_tcxx -lsgx_pthread -lsgx_tcrypto -lsgx_tprotected_fs -l$(SERVICE) -Wl,--end-group \
     -Wl,-Bstatic -Wl,-Bsymbolic -Wl,--no-undefined -Wl,-pie,-eenclave_entry \
     -Wl,--export-dynamic -Wl,--defsym,__ImageBase=0 -Wl,--gc-sections \
     -Wl,--version-script=Enclave.lds
@@ -40,7 +40,7 @@ $(BUILD)/Enclave_t.o: $(BUILD)/Enclave_t.c
 	$(CC) -m64 -O2 -nostdinc -fpie -fstack-protector-strong -ffreestanding -fvisibility=hidden \
         -I$(SGX_SDK)/include -I$(SGX_SDK)/include/tlibc -c $< -o $@
 
-$(BUILD)/libenclave_sgxfs.a: sgxfs/src/lib.rs sgxfs/src/file.rs sgxfs/src/ffi.rs sgxfs/Cargo.toml
+$(BUILD)/libenclave_sgxfs.a: sgxfs/src/lib.rs sgxfs/src/file.rs sgxfs/src/ffi.rs sgxfs/src/quote.rs sgxfs/Cargo.toml
 	mkdir -p $(BUILD)
 	cd sgxfs && env -i PATH="$$PATH" HOME="$$HOME" \
 		RUSTUP_HOME="$${RUSTUP_HOME:-$$HOME/.rustup}" \

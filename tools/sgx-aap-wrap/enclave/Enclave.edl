@@ -1,4 +1,6 @@
 enclave {
+    include "sgx_qve_header.h"
+    include "sgx_ql_quote.h"
     from "sgx_tprotected_fs.edl" import *;
 
     trusted {
@@ -6,5 +8,15 @@ enclave {
         public int ecall_read([in, string] const char* path, [out, count=cap] uint8_t* buf, size_t cap, [out] size_t* out_len);
         public int ecall_export_key([in, string] const char* path, [out, count=16] uint8_t* key);
         public int ecall_import_key([in, string] const char* path, [in, count=16] const uint8_t* key);
+        public int ecall_accept_quote(
+            [in, size=quote_len] const uint8_t* quote,
+            size_t quote_len,
+            [in] const sgx_ql_qe_report_info_t* qve_report,
+            int64_t expiration_check_date,
+            uint32_t collateral_expiration_status,
+            uint32_t quote_verification_result,
+            [in, size=supplemental_data_size] const uint8_t* supplemental,
+            uint32_t supplemental_data_size,
+            [in, count=64] const uint8_t* expected_report_data);
     };
 };

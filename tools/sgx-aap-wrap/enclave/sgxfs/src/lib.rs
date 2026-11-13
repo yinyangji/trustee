@@ -7,6 +7,7 @@
 
 mod ffi;
 mod file;
+mod quote;
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
@@ -63,6 +64,39 @@ pub extern "C" fn ecall_import_key(path: *const c_char, key: *const u8) -> c_int
     let result = import_auto_key(path, &file_key);
     file_key.fill(0);
     result.err().unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn ecall_accept_quote(
+    quote: *const u8,
+    quote_len: usize,
+    qve_report: *const core::ffi::c_void,
+    expiration_check_date: i64,
+    collateral_expiration_status: u32,
+    quote_verification_result: u32,
+    supplemental: *const u8,
+    supplemental_data_size: u32,
+    expected_report_data: *const u8,
+) -> c_int {
+    let quote = unsafe { core::slice::from_raw_parts(quote, quote_len) };
+    let supplemental = if supplemental.is_null() || supplemental_data_size == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(supplemental, supplemental_data_size as usize) }
+    };
+    let expected = unsafe { core::slice::from_raw_parts(expected_report_data, 64) };
+    match quote::accept(
+        quote,
+        qve_report,
+        expiration_check_date,
+        collateral_expiration_status,
+        quote_verification_result,
+        supplemental,
+        expected,
+    ) {
+        Ok(()) => 0,
+        Err(err) => err,
+    }
 }
 
 #[panic_handler]
