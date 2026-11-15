@@ -21,7 +21,7 @@ use policy_engine::{rego::Regorus, PolicyEngine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use serde_variant::to_variant_name;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::{debug, info, warn};
@@ -72,6 +72,14 @@ impl EarAttestationTokenBroker {
 
         policy_engine
             .set_policy("default_ppcie", default_ppcie_policy, false)
+            .await?;
+
+        policy_engine
+            .set_policy(
+                "application_cpu",
+                include_str!("ear_application_policy_cpu.rego"),
+                false,
+            )
             .await?;
 
         if config.signer.is_none() {
@@ -137,14 +145,19 @@ impl EarAttestationTokenBroker {
         policy_ids: Vec<String>,
         rvps_client: Option<RvpsClient>,
     ) -> Result<String> {
-        if policy_ids.len() > 1 {
-            warn!("EAR token only accepts the first policy. The rest will be ignored.");
+        if policy_ids.len() > 16 {
+            bail!("At most 16 attestation policies may be evaluated per request");
         }
-
         if policy_ids.is_empty() {
             bail!("No policy is given for EAR token generation.");
         }
 
+        let mut seen = HashSet::new();
+        for id in &policy_ids {
+            if id.is_empty() || !seen.insert(id) {
+                bail!("Policy IDs must be nonempty and unique");
+            }
+        }
         let mut tee_class_indices: HashMap<String, u8> = HashMap::new();
         let mut submods = BTreeMap::new();
 
@@ -162,127 +175,45 @@ impl EarAttestationTokenBroker {
 
             let tcb_claims_json = serde_json::to_string(&tcb_claims)?;
 
-            // There is a policy for each tee class.
-            // The cpu tee class is loaded as the default.
-            let policy_id = format!("{}_{}", policy_ids[0], tee_claims.tee_class);
-            let mut extensions = vec![];
-            if let Some(ref rvps_client) = rvps_client {
-                let rvps_client = rvps_client.clone();
-                let extension = RegorusExtension {
-                    name: "query_reference_value".to_string(),
-                    id: 1,
-                    extension: Box::new(move |params: Vec<regorus::Value>| {
-                        if params.len() != 1 {
-                            bail!("query_reference_value extension requires exactly one parameter");
+            let mut results = vec![];
+            for id in &policy_ids {
+                let actual_id = format!("{}_{}", id, tee_claims.tee_class);
+                let (evaluated, hash) = self
+                    .evaluate_policy(&actual_id, &tcb_claims_json, &rvps_client)
+                    .await
+                    .with_context(|| format!("Evaluate policy {actual_id}"))?;
+                results.push(json!({
+                    "policy_id": id, "policy_hash": hash,
+                    "trust_claims": evaluated.trust_vector,
+                    "status": evaluated.status,
+                    "appraisal": &evaluated,
+                }));
+                if results.len() == 1 {
+                    appraisal = evaluated;
+                } else {
+                    for incoming in evaluated.trust_vector {
+                        let current = appraisal.trust_vector.mut_by_name(incoming.tag()).unwrap();
+                        if incoming.is_set()
+                            && (!current.is_set()
+                                || incoming.tier() > current.tier()
+                                || (incoming.tier() == current.tier()
+                                    && (i16::from(incoming.value()).abs(), incoming.value())
+                                        > (i16::from(current.value()).abs(), current.value())))
+                        {
+                            current.set(incoming.value());
                         }
-                        let id = params[0]
-                            .as_string()
-                            .context("query_reference_value extension parameter must be a string")?
-                            .to_string();
-                        debug!("query reference value from RVPS: {id}");
-                        let rvps_client = rvps_client.clone();
-                        let reference_value_id = params[0].as_string()?.to_string();
-                        // Policy evaluation runs on tokio's blocking pool, so it is
-                        // safe to block_on the RVPS query here without starving
-                        // runtime workers that drive the gRPC connection pool.
-                        let result = tokio::runtime::Handle::current()
-                            .block_on(async move {
-                                tokio::time::timeout(Duration::from_secs(10), async {
-                                    rvps_client
-                                        .lock()
-                                        .await
-                                        .query_reference_value(&reference_value_id)
-                                        .await
-                                })
-                                .await
-                                .map_err(|e| {
-                                    anyhow!("Get Reference Value from RVPS timeout: {e:?}")
-                                })?
-                            })
-                            .map_err(|e| anyhow!("Get Reference Value from RVPS failed: {e:?}"))?;
-
-                        match result {
-                            Some(v) => {
-                                let json_value = serde_json::to_value(v)?;
-                                let value: regorus::Value = serde_json::from_value(json_value)?;
-                                Ok(value)
-                            }
-                            None => {
-                                warn!("No reference value found for the given id: {id}, use NULL as the returned value");
-                                Ok(regorus::Value::Null)
-                            }
-                        }
-                    }),
-                };
-
-                extensions.push(extension);
-            }
-
-            let policy_results = self
-                .policy_engine
-                .evaluate_rego(
-                    None,
-                    tcb_claims_json,
-                    &policy_id,
-                    vec![TRUST_CLAIMS_RULE.to_string(), EXTENSIONS_RULE.to_string()],
-                    extensions,
-                )
-                .await?;
-
-            match policy_results
-                .eval_rules_result
-                .get(TRUST_CLAIMS_RULE)
-                .with_context(|| {
-                    format!(
-                        "Trust claims rule {TRUST_CLAIMS_RULE} not found for policy {policy_id}"
-                    )
-                })? {
-                Some(value) => {
-                    let trust_claims =
-                        value.as_object().context("Trust claims is not an object")?;
-                    for (k, v) in trust_claims {
-                        let claim_value = v.as_i64().context("Trust claim value not number")?;
-                        debug!("Trust claim: {}: {}", k, claim_value);
-
-                        appraisal
-                            .trust_vector
-                            .mut_by_name(k)
-                            .unwrap()
-                            .set(claim_value as i8);
                     }
                 }
-                None => {
-                    warn!("No trust claims found by enforcing policy {policy_id}, set all TrustVector claims to 0");
-                    appraisal.trust_vector.set_all(0);
-                }
             }
-
-            if !appraisal.trust_vector.any_set() {
-                bail!("At least one policy claim must be set.");
+            if policy_ids.len() > 1 {
+                let value: RawValue = serde_json::from_value(json!(results))?;
+                appraisal
+                    .extensions
+                    .register("ear.trustee.policy-results", -19, value.kind())?;
+                appraisal
+                    .extensions
+                    .set_by_name("ear.trustee.policy-results", value)?;
             }
-
-            // Set extensions from policy result
-            let mut extensions = Extensions::new();
-            let extension_claims = policy_results
-                .eval_rules_result
-                .get(EXTENSIONS_RULE)
-                .context("Extensions rule not found")?
-                .as_ref()
-                .cloned()
-                .unwrap_or(json!([]));
-
-            let extension_claims =
-                serde_json::from_value::<Vec<TokenExtension>>(extension_claims.clone())?;
-            for extension in extension_claims {
-                let extension_value: RawValue =
-                    serde_json::from_str(&serde_json::to_string(&extension.value)?)?;
-
-                extensions.register(&extension.name, extension.key, extension_value.kind())?;
-                extensions.set_by_name(&extension.name, extension_value)?;
-            }
-
-            appraisal.extensions = extensions;
-
             appraisal.annotated_evidence = tcb_claims;
             appraisal.policy_id = Some(policy_ids[0].clone());
             appraisal.update_status_from_trust_vector();
@@ -338,6 +269,142 @@ impl EarAttestationTokenBroker {
         let signed_ear = ear.sign_jwt_pem_with_header(&jwt_header, &private_key_bytes)?;
 
         Ok(signed_ear)
+    }
+
+    async fn evaluate_policy(
+        &self,
+        policy_id: &str,
+        tcb_claims_json: &str,
+        rvps_client: &Option<RvpsClient>,
+    ) -> Result<(Appraisal, String)> {
+        let mut appraisal = Appraisal::new();
+        let mut extensions = vec![];
+        if let Some(ref rvps_client) = rvps_client {
+            let rvps_client = rvps_client.clone();
+            let extension = RegorusExtension {
+                name: "query_reference_value".to_string(),
+                id: 1,
+                extension: Box::new(move |params: Vec<regorus::Value>| {
+                    if params.len() != 1 {
+                        bail!("query_reference_value extension requires exactly one parameter");
+                    }
+                    let id = params[0]
+                        .as_string()
+                        .context("query_reference_value extension parameter must be a string")?
+                        .to_string();
+                    debug!("query reference value from RVPS: {id}");
+                    let rvps_client = rvps_client.clone();
+                    let reference_value_id = params[0].as_string()?.to_string();
+                    // Policy evaluation runs on tokio's blocking pool, so it is
+                    // safe to block_on the RVPS query here without starving
+                    // runtime workers that drive the gRPC connection pool.
+                    let result = tokio::runtime::Handle::current()
+                        .block_on(async move {
+                            tokio::time::timeout(Duration::from_secs(10), async {
+                                rvps_client
+                                    .lock()
+                                    .await
+                                    .query_reference_value(&reference_value_id)
+                                    .await
+                            })
+                            .await
+                            .map_err(|e| anyhow!("Get Reference Value from RVPS timeout: {e:?}"))?
+                        })
+                        .map_err(|e| anyhow!("Get Reference Value from RVPS failed: {e:?}"))?;
+
+                    match result {
+                        Some(v) => {
+                            let json_value = serde_json::to_value(v)?;
+                            let value: regorus::Value = serde_json::from_value(json_value)?;
+                            Ok(value)
+                        }
+                        None => {
+                            warn!("No reference value found for the given id: {id}, use NULL as the returned value");
+                            Ok(regorus::Value::Null)
+                        }
+                    }
+                }),
+            };
+
+            extensions.push(extension);
+        }
+
+        let policy_results = self
+            .policy_engine
+            .evaluate_rego(
+                None,
+                tcb_claims_json.to_owned(),
+                &policy_id,
+                vec![TRUST_CLAIMS_RULE.to_string(), EXTENSIONS_RULE.to_string()],
+                extensions,
+            )
+            .await?;
+
+        match policy_results
+            .eval_rules_result
+            .get(TRUST_CLAIMS_RULE)
+            .with_context(|| {
+                format!("Trust claims rule {TRUST_CLAIMS_RULE} not found for policy {policy_id}")
+            })? {
+            Some(value) => {
+                let trust_claims = value.as_object().context("Trust claims is not an object")?;
+                for (k, v) in trust_claims {
+                    let claim_value = v.as_i64().context("Trust claim value not number")?;
+                    if matches!(claim_value, -1 | 1) {
+                        bail!("Policy reported verifier malfunction or unexpected evidence");
+                    }
+                    debug!("Trust claim: {}: {}", k, claim_value);
+
+                    appraisal
+                        .trust_vector
+                        .mut_by_name(k)
+                        .with_context(|| format!("Unknown trust claim {k}"))?
+                        .set(
+                            i8::try_from(claim_value)
+                                .ok()
+                                .filter(|v| *v != i8::MIN)
+                                .context("Trust claim must be an integer in -127..=127")?,
+                        );
+                }
+            }
+            None => {
+                warn!("No trust claims found by enforcing policy {policy_id}, set all TrustVector claims to 0");
+                appraisal.trust_vector.set_all(0);
+            }
+        }
+
+        if !appraisal
+            .trust_vector
+            .into_iter()
+            .any(|claim| claim.value() != 0)
+        {
+            bail!("At least one policy claim must be set.");
+        }
+
+        // Set extensions from policy result
+        let mut extensions = Extensions::new();
+        let extension_claims = policy_results
+            .eval_rules_result
+            .get(EXTENSIONS_RULE)
+            .context("Extensions rule not found")?
+            .as_ref()
+            .cloned()
+            .unwrap_or(json!([]));
+
+        let extension_claims =
+            serde_json::from_value::<Vec<TokenExtension>>(extension_claims.clone())?;
+        for extension in extension_claims {
+            let extension_value: RawValue =
+                serde_json::from_str(&serde_json::to_string(&extension.value)?)?;
+
+            extensions.register(&extension.name, extension.key, extension_value.kind())?;
+            extensions.set_by_name(&extension.name, extension_value)?;
+        }
+
+        appraisal.extensions = extensions;
+
+        appraisal.update_status_from_trust_vector();
+        Ok((appraisal, policy_results.policy_hash))
     }
 
     pub async fn set_policy(&self, policy_id: String, policy: String) -> Result<()> {
@@ -512,6 +579,123 @@ mod tests {
     use crate::{ear_token::TokenSignerConfig, TeeClaims, AS_POLICY_STORAGE_NAMESPACE};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case(3, 33, 33)]
+    #[case(33, 3, 33)]
+    #[case(3, -96, -96)]
+    #[case(-96, 3, -96)]
+    #[case(3, 2, 3)]
+    #[tokio::test]
+    async fn test_all_policies_are_appraised(
+        #[case] first: i64,
+        #[case] second: i64,
+        #[case] expected: i64,
+    ) {
+        let storage = KeyValueStorageStructConfig::default()
+            .to_client_with_namespace(KeyValueStorageType::Memory, AS_POLICY_STORAGE_NAMESPACE)
+            .await
+            .unwrap();
+        let broker = EarAttestationTokenBroker::new(EarTokenConfiguration::default(), storage)
+            .await
+            .unwrap();
+        for (id, value) in [("base", first), ("app", second)] {
+            broker
+                .set_policy(
+                    format!("{id}_cpu"),
+                    format!("package policy\ntrust_claims := {{\"executables\": {value}}}"),
+                )
+                .await
+                .unwrap();
+        }
+        let token = broker
+            .issue(
+                vec![TeeClaims {
+                    tee: Tee::Tdx,
+                    tee_class: "cpu".into(),
+                    claims: json!({}),
+                    init_data_claims: Value::Null,
+                    runtime_data_claims: Value::Null,
+                }],
+                vec!["base".into(), "app".into()],
+                None,
+            )
+            .await
+            .unwrap();
+        let key = DecodingKey::from_jwk(&broker.pubkey_jwk().unwrap()).unwrap();
+        let ear = Ear::from_jwt(&token, jsonwebtoken::Algorithm::ES256, &key).unwrap();
+        let cpu = &ear.submods["cpu0"];
+        assert_eq!(i64::from(cpu.trust_vector.executables.value()), expected);
+        let decoded = jsonwebtoken::decode::<Value>(
+            &token,
+            &key,
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256),
+        )
+        .unwrap()
+        .claims;
+        let results = &decoded["submods"]["cpu0"]["ear.trustee.policy-results"];
+        assert_eq!(results.as_array().unwrap().len(), 2);
+        assert_eq!(results[0]["policy_id"], "base");
+        assert_eq!(results[1]["policy_id"], "app");
+        assert_eq!(results[1]["trust_claims"]["executables"], second);
+        assert_eq!(results[1]["policy_hash"].as_str().unwrap().len(), 96);
+    }
+
+    #[rstest::rstest]
+    #[case("{\"unknown\": 3}")]
+    #[case("{\"executables\": 128}")]
+    #[case("{\"executables\": -128}")]
+    #[case("{\"executables\": 3.5}")]
+    #[case("{\"executables\": 0}")]
+    #[case("{\"executables\": -1}")]
+    #[case("{\"executables\": 1}")]
+    #[case("{}")]
+    #[tokio::test]
+    async fn test_bad_additional_policy_is_not_ignored(#[case] claims: &str) {
+        let storage = KeyValueStorageStructConfig::default()
+            .to_client_with_namespace(KeyValueStorageType::Memory, AS_POLICY_STORAGE_NAMESPACE)
+            .await
+            .unwrap();
+        let broker = EarAttestationTokenBroker::new(EarTokenConfiguration::default(), storage)
+            .await
+            .unwrap();
+        broker
+            .set_policy(
+                "base_cpu".into(),
+                "package policy\ntrust_claims := {\"executables\": 3}".into(),
+            )
+            .await
+            .unwrap();
+        broker
+            .set_policy(
+                "bad_cpu".into(),
+                format!("package policy\ntrust_claims := {claims}"),
+            )
+            .await
+            .unwrap();
+        for ids in [
+            vec!["base", "bad"],
+            vec!["base", "missing"],
+            vec!["base", "base"],
+            vec!["base", ""],
+            vec![],
+        ] {
+            assert!(broker
+                .issue(
+                    vec![TeeClaims {
+                        tee: Tee::Tdx,
+                        tee_class: "cpu".into(),
+                        claims: json!({}),
+                        init_data_claims: Value::Null,
+                        runtime_data_claims: Value::Null,
+                    }],
+                    ids.into_iter().map(str::to_owned).collect(),
+                    None
+                )
+                .await
+                .is_err());
+        }
+    }
 
     #[tokio::test]
     async fn test_issue_ear_ephemeral_key() {

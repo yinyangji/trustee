@@ -406,6 +406,8 @@ mod tests {
             trusted_jwk_sets: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-builtin")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "coco-as-builtin")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
@@ -456,6 +458,8 @@ mod tests {
             trusted_certs_paths: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "intel-trust-authority-as")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
@@ -549,6 +553,8 @@ mod tests {
             trusted_jwk_sets: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-builtin")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "coco-as-builtin")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
@@ -593,6 +599,8 @@ mod tests {
             trusted_certs_paths: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "intel-trust-authority-as")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
@@ -652,6 +660,8 @@ mod tests {
             trusted_certs_paths: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "intel-trust-authority-as")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "intel-trust-authority-as")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:
@@ -683,6 +693,8 @@ mod tests {
             trusted_jwk_sets: vec![],
             extra_teekey_paths: vec![],
         },
+        #[cfg(all(feature = "as", not(feature = "coco-as-builtin")))]
+        attestation_service: Default::default(),
         #[cfg(feature = "coco-as-builtin")]
         attestation_service: crate::attestation::config::AttestationConfig {
             attestation_service:

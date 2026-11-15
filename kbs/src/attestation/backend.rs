@@ -182,7 +182,7 @@ impl AttestationService {
     pub(crate) async fn new(
         config: AttestationConfig,
         session_storage_backend_type: KeyValueStorageType,
-        storage_backend_config: &StorageBackendConfig,
+        _storage_backend_config: &StorageBackendConfig,
         storage_provider: Arc<dyn StorageProvider>,
     ) -> Result<Self> {
         // A attestation-policy-selector without any policy would leave the evidence
@@ -202,7 +202,7 @@ impl AttestationService {
             AttestationServiceConfig::CoCoASBuiltIn(cfg) => {
                 let built_in_as = super::coco::builtin::BuiltInCoCoAs::new(
                     cfg,
-                    storage_backend_config,
+                    _storage_backend_config,
                     storage_provider.clone(),
                 )
                 .await

@@ -1,0 +1,22 @@
+{
+  "initial": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "files": [
+    {
+      "path": "/approved/python3",
+      "sha384": "711069a6845f5e9f50f5cc82b6e76ba662645fc477b2da665e7b9de995b65a1f4cb242212f8d974edc320cb9ea9c865d"
+    },
+    {
+      "path": "/approved/app.py",
+      "sha384": "349a6742d24ec5e2c2190bd4b9712316cac1e3f2073fc1f54484e3e0ccb05853eb25aab0e48604e4e81959ae86a19f53"
+    }
+  ],
+  "python": true,
+  "arguments": [
+    "--mode",
+    "α"
+  ],
+  "uid": 65534,
+  "gid": 65534,
+  "canonical": "{\"execution\":{\"arguments\":[\"--mode\",\"α\"],\"environment\":{\"LANG\":\"C.UTF-8\",\"PATH\":\"/usr/bin:/bin\",\"TZ\":\"UTC\"},\"gid\":65534,\"kind\":\"python-isolated\",\"resource\":\"sealed-inherited-fd\",\"uid\":65534,\"working_directory\":\"/\"},\"files\":[{\"path\":\"/approved/python3\",\"sha384\":\"711069a6845f5e9f50f5cc82b6e76ba662645fc477b2da665e7b9de995b65a1f4cb242212f8d974edc320cb9ea9c865d\"},{\"path\":\"/approved/app.py\",\"sha384\":\"349a6742d24ec5e2c2190bd4b9712316cac1e3f2073fc1f54484e3e0ccb05853eb25aab0e48604e4e81959ae86a19f53\"}],\"profile\":\"trustee.tdx-workload.v2\",\"version\":2}",
+  "expected": "f317bdfabb0f8a6025fece56d26662b41429163dbb47d26e67bc6a62eb92101bf776267a2c2dad127cd6fbfc177f8de3"
+}

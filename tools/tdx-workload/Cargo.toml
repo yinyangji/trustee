@@ -1,0 +1,22 @@
+[package]
+name = "tdx-workload"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+attester = { git = "https://github.com/confidential-containers/guest-components.git", rev = "da8d93f2797088a5f0636c8c1eeb31da73784fe8", default-features = false, features = ["tdx-attester"] }
+base64.workspace = true
+clap = { workspace = true, features = ["env"] }
+hex.workspace = true
+kbs_protocol.workspace = true
+libc = "0.2"
+reqwest = { workspace = true, features = ["cookies", "default-tls"] }
+serde_json.workspace = true
+serde_json_canonicalizer = "0.3"
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -9,6 +9,7 @@ members = [
     "deps/eventlog",
     "integration-tests",
     "tools/trustee-cli",
+    "tools/tdx-workload",
     "deps/key-value-storage",
     "deps/policy-engine",
 ]

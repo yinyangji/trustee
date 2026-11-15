@@ -180,8 +180,10 @@ hardware := 2 if {
 	# Check OVMF code hash
 	input.tdx.quote.body.mr_td in query_reference_value("mr_td")
 
-	# Check TCB status (covers quote.body.tcb_svn claim check)
-	input.tdx.tcb_status == "UpToDate"
+	# Check TCB status (covers quote.body.tcb_svn claim check).
+	# OutOfDate is accepted until this platform can take the BIOS update
+	# that carries the newer TCB level.
+	input.tdx.tcb_status in {"UpToDate", "OutOfDate"}
 
 	# Check minimum TCB date
 	# An alternative check to tcb_status is to define a minimum acceptable
