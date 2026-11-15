@@ -41,7 +41,11 @@ impl StorageBackend for AliyunEnclaveBackend {
         .await
     }
 
-    async fn write_secret_resource(&self, _resource_desc: ResourceDesc, _data: &[u8]) -> Result<()> {
+    async fn write_secret_resource(
+        &self,
+        _resource_desc: ResourceDesc,
+        _data: &[u8],
+    ) -> Result<()> {
         bail!("AliyunEnclave backend is read-only")
     }
 

@@ -22,7 +22,11 @@ pub const DEFAULT_DEVELOPER_NAME: &str = "https://confidentialcontainers.org";
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct TokenSignerConfig {
+    #[serde(default)]
     pub key_path: String,
+    /// Hardware-independent sealed key reference. Exclusive with key_path.
+    #[serde(default)]
+    pub protected_key: Option<trustee_platform_api::credentials::KeyReference>,
     #[serde(default = "Option::default")]
     pub cert_url: Option<String>,
 
@@ -69,6 +73,8 @@ pub struct EarTokenConfiguration {
     /// Default: True
     #[serde(default = "default_verbose_token")]
     pub verbose_token: bool,
+    /// Optional three-party job contract trust roots.
+    pub cc_ai: Option<trustee_cc_ai::TrustPolicy>,
 }
 
 #[inline]
@@ -86,6 +92,7 @@ impl Default for EarTokenConfiguration {
             profile_name: DEFAULT_PROFILE.to_string(),
             signer: None,
             verbose_token: default_verbose_token(),
+            cc_ai: None,
         }
     }
 }

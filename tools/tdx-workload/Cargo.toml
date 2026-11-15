@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+# Fault injection for isolated integration tests; never bypasses verification.
+integration-test = []
+
 [dependencies]
 anyhow.workspace = true
 attester = { git = "https://github.com/confidential-containers/guest-components.git", rev = "da8d93f2797088a5f0636c8c1eeb31da73784fe8", default-features = false, features = ["tdx-attester"] }

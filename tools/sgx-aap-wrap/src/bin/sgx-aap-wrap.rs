@@ -51,7 +51,7 @@ enum Command {
         file: PathBuf,
         /// `accept` takes the quote as-is. `dcap` verifies it. `test` expects
         /// the `test-quote:` prefix used by unit tests.
-        #[arg(long, default_value = "accept")]
+        #[arg(long, default_value = "dcap")]
         quote_policy: String,
         /// `mock` returns `mock:<secret name>` after the protected file opens.
         /// `aliyun` calls KMS and requires a build with `--features aliyun`.
@@ -98,6 +98,9 @@ async fn main() -> Result<()> {
             kms,
             listen,
         } => {
+            if kms == "aliyun" && quote_policy != "dcap" {
+                bail!("real KMS access requires DCAP quote verification");
+            }
             let quotes = open_quote_policy(&quote_policy)?;
             serve(
                 &listen,

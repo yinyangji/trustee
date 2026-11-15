@@ -50,7 +50,7 @@ int aap_fs_init(const char* signed_enclave)
         sgx_launch_token_t token;
         memset(token, 0, sizeof(token));
         int updated = 0;
-        sgx_status_t status = sgx_create_enclave(signed_enclave, SGX_DEBUG_FLAG, &token, &updated, &g_eid, NULL);
+        sgx_status_t status = sgx_create_enclave(signed_enclave, 0, &token, &updated, &g_eid, NULL);
         rc = status == SGX_SUCCESS ? 0 : -1000 - (int)status;
     }
     pthread_mutex_unlock(&g_mu);

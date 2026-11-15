@@ -55,6 +55,17 @@ pub fn material_from_json(bytes: &[u8]) -> anyhow::Result<AapMaterial> {
     Ok(file.into())
 }
 
+impl From<&AapMaterial> for MaterialFile {
+    fn from(material: &AapMaterial) -> Self {
+        Self {
+            client_key: material.client_key.to_string(),
+            password: material.password.to_string(),
+            cert_pem: material.cert_pem.clone(),
+            kms_instance_id: material.kms_instance_id.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,16 +85,5 @@ mod tests {
         assert!(!debug.contains("CLIENT-KEY"));
         assert!(debug.contains("kst-lab"));
         assert!(material_from_json(br#"{"client_key":"x"}"#).is_err());
-    }
-}
-
-impl From<&AapMaterial> for MaterialFile {
-    fn from(material: &AapMaterial) -> Self {
-        Self {
-            client_key: material.client_key.to_string(),
-            password: material.password.to_string(),
-            cert_pem: material.cert_pem.clone(),
-            kms_instance_id: material.kms_instance_id.clone(),
-        }
     }
 }

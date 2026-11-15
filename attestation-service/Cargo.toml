@@ -61,6 +61,8 @@ key-value-storage.path = "../deps/key-value-storage"
 mobc = { workspace = true, optional = true }
 openssl.workspace = true
 policy-engine.path = "../deps/policy-engine"
+trustee-platform-api = { path = "../deps/platform-api" }
+trustee-cc-ai = { path = "../deps/cc-ai" }
 prost = { workspace = true, optional = true }
 reference-value-provider-service.path = "../rvps"
 regorus.workspace = true
@@ -85,6 +87,7 @@ tonic-prost = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 verifier = { path = "../deps/verifier", default-features = false }
 actix-cors = { version = "0.7", optional = true }
 

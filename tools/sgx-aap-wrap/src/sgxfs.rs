@@ -54,7 +54,8 @@ pub fn verify_tdx_quote(quote: &[u8], expected_report_data: &[u8; 64]) -> Result
         bail!("quote is not a version 4 TDX quote");
     }
     Enclave::get()?;
-    let rc = unsafe { aap_quote_verify(quote.as_ptr(), quote.len(), expected_report_data.as_ptr()) };
+    let rc =
+        unsafe { aap_quote_verify(quote.as_ptr(), quote.len(), expected_report_data.as_ptr()) };
     if rc != 0 {
         bail!("TDX quote verification returned {rc}");
     }
@@ -124,7 +125,8 @@ extern "C" {
         -> i32;
     fn aap_fs_export_key(path: *const libc::c_char, key: *mut u8) -> i32;
     fn aap_fs_import_key(path: *const libc::c_char, key: *const u8) -> i32;
-    fn aap_quote_verify(quote: *const u8, quote_len: usize, expected_report_data: *const u8) -> i32;
+    fn aap_quote_verify(quote: *const u8, quote_len: usize, expected_report_data: *const u8)
+        -> i32;
 }
 
 #[cfg(test)]

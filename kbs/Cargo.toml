@@ -98,6 +98,8 @@ p256 = { workspace = true, features = ["ecdh"] }
 p521 = { workspace = true, features = ["ecdh"] }
 zeroize.workspace = true
 policy-engine.path = "../deps/policy-engine"
+trustee-platform-api = { path = "../deps/platform-api" }
+trustee-cc-ai = { path = "../deps/cc-ai" }
 prometheus = "0.14.0"
 prost = { workspace = true, optional = true }
 rand.workspace = true
@@ -111,6 +113,7 @@ rustls = { version = "0.23", default-features = false, features = [
 semver = "1.0.28"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+serde_json_canonicalizer = "0.3"
 serde_with.workspace = true
 sha2.workspace = true
 shadow-rs.workspace = true

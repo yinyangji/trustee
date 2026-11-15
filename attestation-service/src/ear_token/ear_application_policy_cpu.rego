@@ -8,11 +8,10 @@ default executables := 33
 
 executables := 2 if {
     trusted_measurement_environment
-    rtmr := input.tdx.quote.body.rtmr_3
-    is_string(rtmr)
-    regex.match("^[0-9a-f]{96}$", rtmr)
-    rtmr != "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-    rtmr in query_reference_value("application_rtmr_3")
+    binding := input.workload
+    binding.version == 1
+    valid_digest(binding.measurement, binding.measurement_algorithm)
+    binding.measurement in query_reference_value(binding.reference_id)
 }
 
 # AS exposes these structured claims only after validating the supplied Init-Data
@@ -21,10 +20,8 @@ executables := 2 if {
 # A runtime-data boolean or an RTMR event supplied by the requester is NOT a trust anchor.
 trusted_measurement_environment if {
     init := input.init_data
-    is_string(init)
-    regex.match("^[0-9a-f]{96}$", init)
-    init != "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-    init == input.tdx.quote.body.mr_config_id
+    valid_digest(init, input.workload.launch_algorithm)
+    init == input.workload.launch_digest
     init in query_reference_value("application_init_data")
     policy := input.init_data_claims.agent_policy_claims
     is_object(policy)
@@ -33,3 +30,11 @@ trusted_measurement_environment if {
 }
 
 trust_claims := {"executables": executables}
+
+valid_digest(value, algorithm) if {
+    lengths := {"sha256": 64, "sha384": 96, "sha512": 128}
+    is_string(value)
+    count(value) == lengths[algorithm]
+    regex.match("^[0-9a-f]+$", value)
+    regex.match("[1-9a-f]", value)
+}

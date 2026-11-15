@@ -21,7 +21,7 @@ use policy_engine::{rego::Regorus, PolicyEngine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use serde_variant::to_variant_name;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::{debug, info, warn};
@@ -48,6 +48,9 @@ impl EarAttestationTokenBroker {
         config: EarTokenConfiguration,
         storage: KeyValueStorageInstance,
     ) -> Result<Self> {
+        if let Some(trust) = &config.cc_ai {
+            trust.validate()?;
+        }
         let policy_engine = PolicyEngine::<Regorus>::new(storage);
 
         let default_cpu_policy = include_str!("ear_default_policy_cpu.rego");
@@ -94,8 +97,13 @@ impl EarAttestationTokenBroker {
         }
 
         let signer = config.signer.clone().unwrap();
-        let pem_data = std::fs::read(&signer.key_path)
-            .map_err(|e| anyhow!("Read Token Signer private key failed: {:?}", e))?;
+        let pem_data = match (&signer.protected_key, signer.key_path.is_empty()) {
+            (Some(reference), true) => reference.load("as-token-signing").await?,
+            (None, false) => zeroize::Zeroizing::new(
+                std::fs::read(&signer.key_path).context("Read Token Signer private key failed")?,
+            ),
+            _ => bail!("Configure exactly one of signer.key_path and signer.protected_key"),
+        };
         let private_key = EcKey::private_key_from_pem(&pem_data)?;
         if private_key.group().curve_name() != Some(Nid::X9_62_PRIME256V1) {
             bail!("Only P-256 attestation token signing keys are supported");
@@ -234,7 +242,7 @@ impl EarAttestationTokenBroker {
         }
 
         let now = OffsetDateTime::now_utc();
-        let exp = now
+        let mut exp = now
             .checked_add(TimeDuration::minutes(self.config.duration_min))
             .ok_or(anyhow!("Token expiration overflow."))?;
 
@@ -244,6 +252,58 @@ impl EarAttestationTokenBroker {
 
         extensions.register("iss", 1, RawValueKind::String)?;
         extensions.set_by_name("iss", RawValue::String(self.config.issuer_name.clone()))?;
+
+        // Only verifier-derived InitData can opt into the job profile.
+        let claims = json!({"submods": submods});
+        let evidence = &claims["submods"]["cpu0"]["ear.veraison.annotated-evidence"];
+        if evidence["init_data_claims"]
+            .get(trustee_cc_ai::INIT_DATA_KEY)
+            .is_some()
+        {
+            if submods.len() != 1 {
+                bail!("CC-AI currently supports one CPU TDX protection domain only");
+            }
+            let trust = self
+                .config
+                .cc_ai
+                .as_ref()
+                .context("CC-AI contract trust is not configured")?;
+            trustee_cc_ai::check_appraisals(&claims)?;
+            let (signed, binding) =
+                trustee_cc_ai::evaluate_verified_evidence(evidence, trust, now.unix_timestamp())?;
+            let stage = signed
+                .contract
+                .stages
+                .iter()
+                .find(|s| s.stage == binding.stage)
+                .context("Missing job stage")?;
+            let mut audiences: BTreeSet<String> =
+                stage.grants.iter().map(|g| g.audience.clone()).collect();
+            if binding.stage == trustee_cc_ai::Stage::ModelVerified
+                && signed.contract.purpose == trustee_cc_ai::Purpose::Infer
+            {
+                audiences.extend(signed.contract.service_audiences.clone());
+            }
+            for (name, key, value) in [
+                ("aud", 3, json!(audiences)),
+                (
+                    "cnf",
+                    8,
+                    json!({"jwk": trustee_cc_ai::public_jwk(&evidence["runtime_data_claims"]["tee-pubkey"])?}),
+                ),
+                (trustee_cc_ai::CLAIM, -710, serde_json::to_value(&binding)?),
+            ] {
+                let raw: RawValue = serde_json::from_value(value)?;
+                extensions.register(name, key, raw.kind())?;
+                extensions.set_by_name(name, raw)?;
+            }
+            exp =
+                exp.min(now + TimeDuration::seconds(120))
+                    .min(OffsetDateTime::from_unix_timestamp(
+                        signed.contract.expires_at,
+                    )?);
+            extensions.set_by_name("exp", RawValue::Integer(exp.unix_timestamp()))?;
+        }
 
         let ear = Ear {
             profile: self.config.profile_name.clone(),
@@ -334,7 +394,7 @@ impl EarAttestationTokenBroker {
             .evaluate_rego(
                 None,
                 tcb_claims_json.to_owned(),
-                &policy_id,
+                policy_id,
                 vec![TRUST_CLAIMS_RULE.to_string(), EXTENSIONS_RULE.to_string()],
                 extensions,
             )
@@ -493,6 +553,139 @@ fn generate_ec_keys() -> Result<(EcKey<Private>, Vec<u8>, Vec<u8>)> {
     ))
 }
 
+#[cfg(test)]
+mod cc_ai_tests {
+    use super::*;
+    use key_value_storage::{KeyValueStorageStructConfig, KeyValueStorageType};
+    // Synthetic verified claims exercise AS/RP integration, not hardware quote
+    // verification. Actual TDX acceptance requires the separate cluster suite.
+    #[allow(dead_code)]
+    mod common {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../deps/cc-ai/tests/common/mod.rs"
+        ));
+    }
+
+    async fn broker(trust: trustee_cc_ai::TrustPolicy) -> EarAttestationTokenBroker {
+        let storage = KeyValueStorageStructConfig::default()
+            .to_client_with_namespace(KeyValueStorageType::Memory, "cc_ai_unit")
+            .await
+            .unwrap();
+        let broker = EarAttestationTokenBroker::new(
+            EarTokenConfiguration {
+                issuer_name: "https://as.example".into(),
+                cc_ai: Some(trust),
+                ..Default::default()
+            },
+            storage,
+        )
+        .await
+        .unwrap();
+        for id in ["default_cpu", "application_cpu"] {
+            broker.set_policy(id.into(), "package policy\ntrust_claims := {\"executables\":2,\"hardware\":2,\"configuration\":2}\nextensions := []".into()).await.unwrap();
+        }
+        broker
+    }
+    fn verified(e: &Value) -> TeeClaims {
+        TeeClaims {
+            tee: Tee::Tdx,
+            tee_class: "cpu".into(),
+            claims: json!({"quote":{"body":{"rtmr_3":"22".repeat(48),"mr_config_id":"cc".repeat(48)}},
+                "init_data":"cc".repeat(48),"report_data":"dd".repeat(48)}),
+            init_data_claims: e["init_data_claims"].clone(),
+            runtime_data_claims: e["runtime_data_claims"].clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn as_signature_background_authorization_and_passport_roundtrip() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (trust, signed, fixture) = common::fixture(now);
+        let broker = broker(trust.clone()).await;
+        let e = &fixture["submods"]["cpu0"]["ear.veraison.annotated-evidence"];
+        let token = broker
+            .issue(
+                vec![verified(e)],
+                vec!["default".into(), "application".into()],
+                None,
+            )
+            .await
+            .unwrap();
+        let pem = PKey::from_ec_key(broker.private_key.clone())
+            .unwrap()
+            .public_key_to_pem()
+            .unwrap();
+        let claims = trustee_cc_ai::verify_pinned_result(&token, &pem).unwrap();
+        assert!(claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap() <= 120);
+        common::data_policy(trust.clone())
+            .authorize(&claims, "workload/data/v1", now)
+            .unwrap();
+        let mut user = common::data_policy(trust);
+        user.role = trustee_cc_ai::Role::User;
+        user.audience = "https://client.example".into();
+        trustee_cc_ai::verify_passport(
+            &claims,
+            &user,
+            &trustee_cc_ai::PassportExpectation {
+                nonce: "fresh-challenge-0123456789",
+                job_id: "job-1",
+                contract_digest: &trustee_cc_ai::sha384(
+                    &trustee_cc_ai::canonical(&signed.contract).unwrap(),
+                ),
+                peer_key: &claims["cnf"]["jwk"],
+            },
+            now,
+        )
+        .unwrap();
+        let (_, _, wrong) = generate_ec_keys().unwrap();
+        assert!(trustee_cc_ai::verify_pinned_result(&token, &wrong).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_trust_failed_appraisal_and_modified_measurement_cannot_get_job_token() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (trust, _, fixture) = common::fixture(now);
+        let e = &fixture["submods"]["cpu0"]["ear.veraison.annotated-evidence"];
+        let mut broker = broker(trust.clone()).await;
+        broker.config.cc_ai = None;
+        assert!(broker
+            .issue(
+                vec![verified(e)],
+                vec!["default".into(), "application".into()],
+                None
+            )
+            .await
+            .is_err());
+        broker.config.cc_ai = Some(trust);
+        let mut changed = verified(e);
+        changed.claims["quote"]["body"]["rtmr_3"] = json!("99".repeat(48));
+        assert!(broker
+            .issue(
+                vec![changed],
+                vec!["default".into(), "application".into()],
+                None
+            )
+            .await
+            .is_err());
+        broker
+            .set_policy(
+                "application_cpu".into(),
+                "package policy\ntrust_claims := {\"executables\":97}\nextensions := []".into(),
+            )
+            .await
+            .unwrap();
+        assert!(broker
+            .issue(
+                vec![verified(e)],
+                vec!["default".into(), "application".into()],
+                None
+            )
+            .await
+            .is_err());
+    }
+}
+
 /// This function does three things.
 ///
 /// 1) If the input claims include an init_data claim (meaning that
@@ -517,6 +710,15 @@ pub fn transform_claims(
     verbose: bool,
 ) -> Result<BTreeMap<String, RawValue>> {
     let mut output_claims = BTreeMap::new();
+    if let Some(binding) = trustee_platform_api::attestation::application_binding(
+        to_variant_name(&tee)?,
+        &input_claims,
+    ) {
+        output_claims.insert(
+            "workload".into(),
+            serde_json::from_value(serde_json::to_value(binding)?)?,
+        );
+    }
 
     // If the verifier produces an init_data claim (meaning that
     // it has validated the init_data hash), add the JSON init_data_claims,
@@ -579,6 +781,130 @@ mod tests {
     use crate::{ear_token::TokenSignerConfig, TeeClaims, AS_POLICY_STORAGE_NAMESPACE};
 
     use super::*;
+
+    #[tokio::test]
+    async fn conflicting_signer_sources_are_rejected_before_loading_secrets() {
+        let provider = key_value_storage::KvStorageProvider::new(
+            key_value_storage::StorageBackendConfig::default(),
+        );
+        use key_value_storage::StorageProvider;
+        let storage = provider
+            .get_or_register(AS_POLICY_STORAGE_NAMESPACE)
+            .await
+            .unwrap();
+        let config: EarTokenConfiguration = serde_json::from_value(json!({"signer": {
+            "key_path": "/not-read",
+            "protected_key": {
+                "provider": {"command": "/not-executed", "expected_provider": "test"},
+                "sealed_path": "/not-read-either",
+                "binding": {"key_id":"signer-v1", "purpose":"as-token-signing"}
+            }
+        }}))
+        .unwrap();
+        let result = EarAttestationTokenBroker::new(config, storage).await;
+        assert!(result.err().unwrap().to_string().contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn two_modes_close_rvps_appraisal_signature_and_resource_authorization() {
+        use crate::rvps::{initialize_rvps_client, RvpsConfig};
+        use key_value_storage::{KvStorageProvider, StorageBackendConfig, StorageProvider};
+        use trustee_platform_api::policy::PolicyMode;
+
+        let provider = KvStorageProvider::new(StorageBackendConfig::default());
+        let rvps = initialize_rvps_client(
+            &RvpsConfig::default(),
+            provider.clone(),
+            KeyValueStorageType::Memory,
+        )
+        .await
+        .unwrap();
+        let refs = json!({"mr_td": ["firmware"], "rtmr_1": ["kernel"], "rtmr_2": ["cmdline"],
+            "xfam": ["xfam"], "application_rtmr_3": ["ab".repeat(48)], "application_init_data": ["fa".repeat(48)]});
+        rvps.lock()
+            .await
+            .verify_and_extract(
+                &json!({"version":"0.1.0", "type":"sample",
+            "payload":STANDARD.encode(refs.to_string())})
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let storage = provider
+            .get_or_register(AS_POLICY_STORAGE_NAMESPACE)
+            .await
+            .unwrap();
+        let broker = EarAttestationTokenBroker::new(EarTokenConfiguration::default(), storage)
+            .await
+            .unwrap();
+        let key = DecodingKey::from_jwk(&broker.pubkey_jwk().unwrap()).unwrap();
+        let resource_policy = include_str!("../../../kbs/sample_policies/default.rego");
+
+        for (mode, app, boot, launch, repo, expected) in [
+            (PolicyMode::Default, true, true, true, "default", true),
+            (PolicyMode::Default, false, true, false, "default", true),
+            (PolicyMode::Default, true, true, true, "workload", false),
+            (PolicyMode::Workload, true, true, true, "workload", true),
+            (PolicyMode::Workload, false, true, true, "workload", false),
+            (PolicyMode::Workload, true, false, true, "workload", false),
+            (PolicyMode::Workload, true, true, false, "workload", false),
+        ] {
+            let raw = json!({"init_data": "fa".repeat(48), "quote": {
+                "header": {"tee_type":"81000000", "vendor_id":"939a7233f79c4ca9940a0db3957f0607"},
+                "body": {"mr_td": if boot {"firmware"} else {"tampered"}, "rtmr_1":"kernel", "rtmr_2":"cmdline",
+                    "xfam":"xfam", "rtmr_3": if app {"ab".repeat(48)} else {"cd".repeat(48)}, "mr_config_id":"fa".repeat(48)}},
+                "tcb_status":"UpToDate", "collateral_expiration_status":"0", "td_attributes":{"debug":false}});
+            // These are synthetic native-verifier outputs. No quote signature is claimed.
+            let token = broker
+                .issue(
+                    vec![TeeClaims {
+                        tee: Tee::Tdx,
+                        tee_class: "cpu".into(),
+                        claims: raw,
+                        init_data_claims: if launch {
+                            json!({"agent_policy_claims":{"containers":[{"OCI":{}}]}})
+                        } else {
+                            Value::Null
+                        },
+                        runtime_data_claims: json!({"workload":{"measurement":"spoofed"}}),
+                    }],
+                    mode.policy_ids(),
+                    Some(rvps.clone()),
+                )
+                .await
+                .unwrap();
+            let claims = jsonwebtoken::decode::<Value>(
+                &token,
+                &key,
+                &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256),
+            )
+            .unwrap()
+            .claims;
+            let result = Regorus::default()
+                .evaluate(
+                    Some(
+                        json!({"plugin":"resource", "resource-path":[repo,"test","key"]})
+                            .to_string(),
+                    ),
+                    claims.to_string(),
+                    resource_policy.into(),
+                    vec!["data.policy.allow".into()],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.eval_rules_result["data.policy.allow"],
+                Some(json!(expected)),
+                "{mode:?} app={app} boot={boot} launch={launch}"
+            );
+            assert_ne!(
+                claims["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["workload"]
+                    ["measurement"],
+                "spoofed"
+            );
+        }
+    }
 
     #[rstest::rstest]
     #[case(3, 33, 33)]
@@ -742,13 +1068,16 @@ mod tests {
         private_key_file.write_all(&private_key_bytes).unwrap();
 
         let signer = TokenSignerConfig {
+            protected_key: None,
             key_path: private_key_file.path().to_str().unwrap().to_string(),
             cert_url: None,
             cert_path: None,
         };
 
-        let mut config = EarTokenConfiguration::default();
-        config.signer = Some(signer);
+        let config = EarTokenConfiguration {
+            signer: Some(signer),
+            ..Default::default()
+        };
         let storage = KeyValueStorageStructConfig::default()
             .to_client_with_namespace(KeyValueStorageType::Memory, AS_POLICY_STORAGE_NAMESPACE)
             .await
@@ -817,13 +1146,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_jwks_matches_fixture() {
         let signer = TokenSignerConfig {
+            protected_key: None,
             key_path: "tests/fixtures/jwk/signing-key.pem".to_string(),
             cert_url: None,
             cert_path: Some("tests/fixtures/jwk/cert-chain.pem".to_string()),
         };
 
-        let mut config = EarTokenConfiguration::default();
-        config.signer = Some(signer);
+        let config = EarTokenConfiguration {
+            signer: Some(signer),
+            ..Default::default()
+        };
         let storage = KeyValueStorageStructConfig::default()
             .to_client_with_namespace(KeyValueStorageType::Memory, AS_POLICY_STORAGE_NAMESPACE)
             .await

@@ -22,6 +22,8 @@ tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 libc = "0.2"
+tempfile.workspace = true
+trustee-platform-api = { path = "../../deps/platform-api" }
 
 [features]
 # Link the guest-components Aliyun client into the wrap process.

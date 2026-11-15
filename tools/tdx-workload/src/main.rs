@@ -35,6 +35,12 @@ struct Args {
     /// ATTESTATION_POLICY_SELECTOR; an explicit flag overrides the variable.
     #[arg(long, env = "ATTESTATION_POLICY_SELECTOR")]
     selector: Option<String>,
+    /// Relying-party name for a passport attestation. Used with --passport-nonce.
+    #[arg(long)]
+    passport_audience: Option<String>,
+    /// Challenge issued by the data or model KMS. KBS uses it as the attestation nonce.
+    #[arg(long)]
+    passport_nonce: Option<String>,
     #[arg(long)]
     resource: Option<String>,
     /// Files in manifest order. The first is the executable, or script with --interpreter.
@@ -57,6 +63,10 @@ struct Args {
     output_dir: PathBuf,
     #[arg(long, default_value = "/run/tdx-workload/events.bin")]
     journal: PathBuf,
+    /// Corrupt a fresh hardware quote to test AS rejection (lab builds only).
+    #[cfg(feature = "integration-test")]
+    #[arg(long)]
+    corrupt_quote: bool,
     #[arg(last = true)]
     arguments: Vec<String>,
 }
@@ -65,6 +75,29 @@ struct Snapshot {
     file: File,
     path: PathBuf,
     digest: String,
+}
+
+fn insert_passport(
+    params: &mut Value,
+    audience: &Option<String>,
+    nonce: &Option<String>,
+) -> Result<()> {
+    match (audience, nonce) {
+        (None, None) => Ok(()),
+        (Some(audience), Some(nonce)) => {
+            params["passport-audience"] = json!(audience);
+            params["passport-nonce"] = json!(nonce);
+            Ok(())
+        }
+        _ => bail!("passport audience and nonce must be supplied together"),
+    }
+}
+
+fn bind_passport_audience(mut runtime: Value, audience: &Option<String>) -> Value {
+    if let Some(audience) = audience {
+        runtime["audience"] = json!(audience);
+    }
+    runtime
 }
 
 fn snapshot(path: &Path) -> Result<Snapshot> {
@@ -321,6 +354,11 @@ async fn main() -> Result<()> {
     if let Some(selector) = args.selector.as_ref().filter(|value| !value.is_empty()) {
         params["attestation-policy-selector"] = json!(selector);
     }
+    insert_passport(
+        &mut params,
+        &args.passport_audience,
+        &args.passport_nonce,
+    )?;
     let challenge = checked(
         client
             .post(format!("{}/kbs/v0/auth", args.url))
@@ -329,12 +367,20 @@ async fn main() -> Result<()> {
             .await?,
     )
     .await?;
+    if let Some(nonce) = &args.passport_nonce {
+        if challenge["nonce"].as_str() != Some(nonce.as_str()) {
+            bail!("KBS did not bind the relying-party challenge");
+        }
+    }
     let key = TeeKeyPair::new()?;
     let runtime_data = json!({"nonce":challenge["nonce"], "tee-pubkey":key.export_pubkey()?});
-    let primary_runtime_data = json!({
-        "nonce": challenge["nonce"], "tee-pubkey": runtime_data["tee-pubkey"],
-        "additional-evidence": "{}",
-    });
+    let primary_runtime_data = bind_passport_audience(
+        json!({
+            "nonce": challenge["nonce"], "tee-pubkey": runtime_data["tee-pubkey"],
+            "additional-evidence": "{}",
+        }),
+        &args.passport_audience,
+    );
     let report_data =
         Sha384::digest(serde_json_canonicalizer::to_vec(&primary_runtime_data)?).to_vec();
     let mut evidence = TdxAttester::new().get_evidence(report_data).await?;
@@ -363,6 +409,15 @@ async fn main() -> Result<()> {
             log.extend([0xff; 8]);
             evidence["cc_eventlog"] = json!(STANDARD.encode(log));
         }
+    }
+    #[cfg(feature = "integration-test")]
+    if args.corrupt_quote {
+        let encoded = evidence["quote"].as_str().context("Missing quote")?;
+        let mut quote = STANDARD.decode(encoded)?;
+        if quote.len() <= 600 { bail!("Quote is too short for the corruption test"); }
+        // Alter the signed TDX report body while preserving its wire encoding.
+        quote[600] ^= 1;
+        evidence["quote"] = json!(STANDARD.encode(quote));
     }
     write_private(
         &args.output_dir.join("evidence.json"),
@@ -425,6 +480,24 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passport_audience_is_bound_into_the_quoted_runtime_data() {
+        let mut params = json!({});
+        assert!(insert_passport(&mut params, &None, &None).is_ok());
+        assert!(insert_passport(&mut params, &Some("model-kms".into()), &None).is_err());
+        insert_passport(
+            &mut params,
+            &Some("model-kms".into()),
+            &Some("model-challenge-1".into()),
+        )
+        .unwrap();
+        assert_eq!(params["passport-audience"], "model-kms");
+        let plain = bind_passport_audience(json!({"nonce": "n", "additional-evidence": "{}"}), &None);
+        assert!(plain.get("audience").is_none());
+        let bound = bind_passport_audience(plain, &Some("data-kms".into()));
+        assert_eq!(bound["audience"], "data-kms");
+    }
 
     #[test]
     fn execution_cannot_downgrade_to_boot_only_or_share_service_identity() {

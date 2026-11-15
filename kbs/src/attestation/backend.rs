@@ -149,6 +149,13 @@ fn resolve_policy_ids(
         .as_str()
         .context("attestation-policy-selector is not a string")?;
 
+    if let Ok(mode) = trustee_platform_api::policy::PolicyMode::parse(policy_selector) {
+        return Ok(Some(mode.policy_ids()));
+    }
+    if policy_selector == "application" {
+        bail!("application-only attestation is not a public policy mode");
+    }
+
     policy_id_map
         .get(policy_selector)
         .cloned()
@@ -188,6 +195,15 @@ impl AttestationService {
         // A attestation-policy-selector without any policy would leave the evidence
         // unevaluated, which some Attestation Services accept silently.
         for (policy_selector, policy_ids) in &config.policy_id_map {
+            if let Ok(mode) = trustee_platform_api::policy::PolicyMode::parse(policy_selector) {
+                if *policy_ids != mode.policy_ids() {
+                    return Err(Error::AttestationServiceInitialization {
+                        source: anyhow!(
+                            "reserved policy mode {policy_selector} cannot be remapped"
+                        ),
+                    });
+                }
+            }
             if policy_ids.is_empty() {
                 return Err(Error::AttestationServiceInitialization {
                     source: anyhow!(
@@ -314,12 +330,14 @@ impl AttestationService {
             debug!("Selected attestation policies: {policy_ids:?}");
         }
 
-        let challenge = self
+        let mut challenge = self
             .inner
             .generate_challenge(request.tee, request.extra_params.clone())
             .await
             .inspect_err(|_| AUTH_ERRORS.inc())
             .context("Attestation Service generate challenge failed")?;
+        challenge.nonce = crate::passport::bound_challenge(&challenge.nonce, &request.extra_params)
+            .inspect_err(|_| AUTH_ERRORS.inc())?;
 
         let session = SessionStatus::auth(request, self.timeout, challenge);
 
@@ -357,7 +375,7 @@ impl AttestationService {
         let attestation: Attestation = serde_json::from_slice(attestation)
             .inspect_err(|_| ATTESTATION_ERRORS.inc())
             .context("deserialize Attestation")?;
-        let (tee, nonce) = {
+        let (tee, nonce, passport_audience) = {
             let session = self
                 .session_map
                 .get(session_id)
@@ -396,7 +414,14 @@ impl AttestationService {
                 .context("Failed to serialize Attestation")?;
             debug!("Attestation: {attestation_str}");
 
-            (session.request().tee, session.challenge().nonce.to_string())
+            let passport =
+                crate::passport::PassportBinding::from_extra(&session.request().extra_params)
+                    .inspect_err(|_| ATTESTATION_ERRORS.inc())?;
+            (
+                session.request().tee,
+                session.challenge().nonce.to_string(),
+                passport.map(|binding| binding.audience),
+            )
         };
 
         let mut evidence_to_verify: Vec<IndependentEvidence> = vec![];
@@ -410,11 +435,12 @@ impl AttestationService {
             "nonce": nonce,
         });
 
-        let primary_runtime_data = json!({
-            "tee-pubkey": attestation.runtime_data.tee_pubkey,
-            "nonce": nonce,
-            "additional-evidence": attestation.tee_evidence.additional_evidence,
-        });
+        let primary_runtime_data = crate::passport::runtime_data(
+            &nonce,
+            &attestation.runtime_data.tee_pubkey,
+            passport_audience.as_deref(),
+            &attestation.tee_evidence.additional_evidence,
+        );
 
         let mut primary_evidence = IndependentEvidence {
             tee,
@@ -600,6 +626,27 @@ mod tests {
             &json!({"attestation-policy-selector": "alice"})
         )
         .is_err());
+        assert_eq!(
+            resolve_policy_ids(
+                &policy_id_map,
+                &json!({"attestation-policy-selector": "default"})
+            )
+            .unwrap(),
+            Some(vec!["default".into()])
+        );
+        assert_eq!(
+            resolve_policy_ids(
+                &policy_id_map,
+                &json!({"attestation-policy-selector": "workload"})
+            )
+            .unwrap(),
+            Some(vec!["default".into(), "application".into()])
+        );
+        assert!(resolve_policy_ids(
+            &policy_id_map,
+            &json!({"attestation-policy-selector": "application"})
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -633,7 +680,7 @@ mod tests {
             let found = nonces.contains(&nonce);
 
             // The nonces should be unique
-            assert_eq!(found, false);
+            assert!(!found);
 
             nonces.push(nonce);
         }

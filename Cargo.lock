@@ -661,8 +661,11 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "trustee-cc-ai",
+ "trustee-platform-api",
  "uuid",
  "verifier",
+ "zeroize",
 ]
 
 [[package]]
@@ -4358,6 +4361,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "serde_with",
  "serial_test",
  "sgx-aap-wrap",
@@ -4375,6 +4379,8 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "trustee-cc-ai",
+ "trustee-platform-api",
  "uuid",
  "vaultrs",
  "zeroize",
@@ -7053,8 +7059,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tracing",
+ "trustee-platform-api",
  "zeroize",
 ]
 
@@ -8272,6 +8280,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "trustee-cc-ai"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "hex",
+ "openssl",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.11.0",
+ "tempfile",
+ "time",
+ "toml",
+]
+
+[[package]]
 name = "trustee-cli"
 version = "0.1.0"
 dependencies = [
@@ -8288,6 +8314,20 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "trustee-platform-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

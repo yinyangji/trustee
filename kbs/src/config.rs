@@ -143,6 +143,9 @@ impl Default for HttpServerConfig {
 /// Contains all configurable KBS properties.
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 pub struct KbsConfig {
+    /// Mandatory asset-owner job grants, independent of mutable Rego policy.
+    #[serde(default)]
+    pub cc_ai: Option<trustee_cc_ai::RelyingPartyPolicy>,
     /// Attestation token result broker config.
     #[serde(default)]
     pub attestation_token: AttestationTokenVerifierConfig,
@@ -345,6 +348,7 @@ mod tests {
 
     #[rstest]
     #[case("test_data/configs/coco-as-grpc-1.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec!["/etc/ca".into(), "/etc/ca2".into()],
             insecure_header_jwk: false,
@@ -400,6 +404,7 @@ mod tests {
         PluginsConfig::ResourceStorage(RepositoryConfig::KvStorage)],
     })]
     #[case("test_data/configs/coco-as-builtin-1.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_header_jwk: false,
@@ -452,6 +457,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/intel-ta-1.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_jwk_sets: vec!["/etc/ca".into(), "/etc/ca2".into()],
             insecure_header_jwk: false,
@@ -509,6 +515,7 @@ mod tests {
         PluginsConfig::ResourceStorage(RepositoryConfig::KvStorage)],
     })]
     #[case("test_data/configs/coco-as-grpc-2.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             ..Default::default()
         },
@@ -547,6 +554,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/coco-as-builtin-2.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_header_jwk: false,
@@ -593,6 +601,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/intel-ta-2.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_jwk_sets: vec!["https://portal.trustauthority.intel.com".into()],
             insecure_header_jwk: false,
@@ -629,6 +638,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/coco-as-grpc-3.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             ..Default::default()
         },
@@ -654,6 +664,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/intel-ta-3.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_jwk_sets: vec!["https://portal.trustauthority.intel.com".into()],
             insecure_header_jwk: false,
@@ -687,6 +698,7 @@ mod tests {
         plugins: Vec::new(),
     })]
     #[case("test_data/configs/coco-as-builtin-3.toml",         KbsConfig {
+        cc_ai: None,
         attestation_token: AttestationTokenVerifierConfig {
             trusted_certs_paths: vec![],
             insecure_header_jwk: false,
@@ -734,7 +746,32 @@ mod tests {
         ],
     })]
     fn read_config(#[case] config_path: &str, #[case] expected: KbsConfig) {
-        let config = KbsConfig::try_from(Path::new(config_path)).unwrap();
+        // Reduced platform builds must reject fixtures for disabled AS backends.
+        // Check that behavior instead of requiring every hardware SDK in tests.
+        let source: toml::Value =
+            toml::from_str(&std::fs::read_to_string(config_path).unwrap()).unwrap();
+        let supported = match source
+            .get("attestation_service")
+            .and_then(|v| v.get("type"))
+            .and_then(toml::Value::as_str)
+        {
+            Some("coco_as_builtin") => cfg!(any(
+                feature = "coco-as-builtin",
+                feature = "coco-as-builtin-no-verifier"
+            )),
+            Some("intel_ta") => cfg!(feature = "intel-trust-authority-as"),
+            Some("coco_as_grpc") => cfg!(feature = "coco-as-grpc"),
+            _ => true,
+        };
+        let result = KbsConfig::try_from(Path::new(config_path));
+        if !supported {
+            assert!(
+                result.is_err(),
+                "disabled AS backend must be rejected: {config_path}"
+            );
+            return;
+        }
+        let config = result.unwrap();
         assert_eq!(config, expected, "case {config_path}");
     }
 
@@ -776,18 +813,22 @@ type = "Simple"
 
     #[test]
     fn test_tls_version_range_validation_error() {
-        let mut config = TlsConfig::default();
-        config.min_version = Some(TlsVersion::Tls13);
-        config.max_version = Some(TlsVersion::Tls12);
+        let config = TlsConfig {
+            min_version: Some(TlsVersion::Tls13),
+            max_version: Some(TlsVersion::Tls12),
+            ..Default::default()
+        };
 
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_tls_version_range_validation_ok() {
-        let mut config = TlsConfig::default();
-        config.min_version = Some(TlsVersion::Tls12);
-        config.max_version = Some(TlsVersion::Tls13);
+        let config = TlsConfig {
+            min_version: Some(TlsVersion::Tls12),
+            max_version: Some(TlsVersion::Tls13),
+            ..Default::default()
+        };
 
         assert!(config.validate().is_ok());
     }

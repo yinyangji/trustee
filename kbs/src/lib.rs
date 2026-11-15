@@ -25,4 +25,6 @@ pub mod admin;
 pub mod http;
 pub mod jwe;
 
+pub mod passport;
 pub mod prometheus;
+pub mod resource_policy;

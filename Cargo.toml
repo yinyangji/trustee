@@ -12,6 +12,8 @@ members = [
     "tools/tdx-workload",
     "deps/key-value-storage",
     "deps/policy-engine",
+    "deps/platform-api",
+    "deps/cc-ai",
 ]
 resolver = "2"
 

@@ -139,7 +139,7 @@ impl ResourceStorage {
             }
             #[cfg(feature = "aliyun")]
             RepositoryConfig::Aliyun(config) => {
-                let client = super::aliyun_kms::AliyunKmsBackend::new(&config)?;
+                let client = super::aliyun_kms::AliyunKmsBackend::new(&config).await?;
                 Ok(Self {
                     backend: Arc::new(client),
                 })

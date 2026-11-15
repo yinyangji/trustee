@@ -385,6 +385,12 @@ fn parse_init_data(data: Option<InitDataInput>) -> Result<(Option<Vec<u8>>, Valu
                     // If there is a policy rego file, replace the full policy file
                     // with some claims extracted from the file.
                     if let Some(Value::String(rego_str)) = map.get("policy.rego").cloned() {
+                        // Derived from the exact hash-bound InitData policy;
+                        // overwrite any caller-supplied reserved field.
+                        map.insert(
+                            trustee_cc_ai::AGENT_POLICY_DIGEST.to_string(),
+                            Value::String(trustee_cc_ai::sha384(rego_str.as_bytes())),
+                        );
                         if let Some(policy_data) = extract_policy_data(&rego_str) {
                             // Since we found some policy claims, remove the original
                             // policy rego from the claims.

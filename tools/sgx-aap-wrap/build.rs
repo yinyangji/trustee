@@ -3,6 +3,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    if env::var("SGX_MODE").is_ok_and(|mode| mode != "HW") {
+        panic!("the hardware credential provider requires SGX_MODE=HW");
+    }
+    println!("cargo:rerun-if-env-changed=SGX_SDK");
+    println!("cargo:rerun-if-env-changed=SGX_MODE");
+    println!("cargo:rerun-if-changed=enclave/Enclave.config.xml");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let enclave = manifest.join("enclave");
     let sdk = env::var("SGX_SDK").unwrap_or_else(|_| "/home/chenpengyu/sgxsdk".to_string());
@@ -31,9 +37,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=aap_fs_host");
     println!("cargo:rustc-link-lib=static=sgx_uprotected_fs");
     println!("cargo:rustc-link-lib=dylib=sgx_urts");
-    println!(
-        "cargo:rustc-link-arg=/usr/lib/x86_64-linux-gnu/libsgx_dcap_quoteverify.so.1"
-    );
+    println!("cargo:rustc-link-arg=/usr/lib/x86_64-linux-gnu/libsgx_dcap_quoteverify.so.1");
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=dl");
 }

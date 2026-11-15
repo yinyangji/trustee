@@ -12,11 +12,13 @@
 //! exports the 128-bit file key for backup. `sgx_fimport_auto_key` opens that
 //! file on another CPU. `sgx_seal_data` is not used.
 //!
-//! The default quote policy accepts the bytes without verification. `dcap`
-//! checks the quote with `tee_verify_quote` and
+//! The default quote policy `dcap` checks the quote with `tee_verify_quote` and
 //! `sgx_tvl_verify_qve_report_and_identity`.
+//! New deployments should use the local `sgx-key-provider` sealing driver;
+//! the legacy remote wrap endpoint does not implement KBS identity allowlists.
 
 mod crypto;
+pub mod key_provider;
 mod material;
 mod quote;
 mod server;

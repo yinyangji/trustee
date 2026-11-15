@@ -8,8 +8,7 @@ pub trait QuotePolicy: Send + Sync {
     fn verify(&self, quote: &[u8], report_data: &[u8; 64]) -> Result<()>;
 }
 
-/// Accepts the quote bytes without checking them. This is the default while
-/// Quote Verification Enclave is not installed.
+/// Explicit lab-only policy. Real KMS CLI mode refuses this policy.
 pub struct AcceptQuotePolicy;
 
 impl QuotePolicy for AcceptQuotePolicy {
@@ -52,6 +51,13 @@ pub fn open_quote_policy(kind: &str) -> Result<Box<dyn QuotePolicy>> {
 }
 
 #[cfg(test)]
+pub fn test_quote(report_data: &[u8; 64]) -> Vec<u8> {
+    let mut quote = b"test-quote:".to_vec();
+    quote.extend_from_slice(report_data);
+    quote
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -81,11 +87,4 @@ mod tests {
         assert!(policy.verify(&quote, &[8u8; 64]).is_err());
         assert!(open_quote_policy("other").is_err());
     }
-}
-
-#[cfg(test)]
-pub fn test_quote(report_data: &[u8; 64]) -> Vec<u8> {
-    let mut quote = b"test-quote:".to_vec();
-    quote.extend_from_slice(report_data);
-    quote
 }

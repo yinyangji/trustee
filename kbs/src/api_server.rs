@@ -82,6 +82,22 @@ impl ApiServer {
     }
 
     pub async fn new(config: KbsConfig) -> Result<Self> {
+        if let Some(policy) = &config.cc_ai {
+            policy.validate().map_err(|_| Error::PolicyDeny)?;
+            if policy.role == trustee_cc_ai::Role::User
+                || config.attestation_token.insecure_header_jwk
+                || matches!(
+                    &config.admin,
+                    crate::admin::AdminConfig::InsecureAllowAll { .. }
+                )
+            {
+                return Err(Error::PolicyDeny);
+            }
+        }
+        #[cfg(not(feature = "as"))]
+        if config.cc_ai.is_some() {
+            return Err(Error::PolicyDeny);
+        }
         let storage_provider =
             key_value_storage::KvStorageProvider::new(config.storage_backend.clone());
         info!(
@@ -250,11 +266,21 @@ pub(crate) async fn api(
     let policy_data_str = policy_data.to_string();
     match plugin {
         #[cfg(feature = "as")]
-        "auth" if request.method() == Method::POST => core
-            .attestation_service
-            .auth(&body)
-            .await
-            .map_err(From::from),
+        "auth" if request.method() == Method::POST => {
+            if core.config.cc_ai.is_some() {
+                let auth: serde_json::Value =
+                    serde_json::from_slice(&body).map_err(|_| Error::PolicyDeny)?;
+                if auth["extra-params"].get("passport-nonce").is_some()
+                    || auth["extra-params"].get("passport-audience").is_some()
+                {
+                    return Err(Error::PolicyDeny);
+                }
+            }
+            core.attestation_service
+                .auth(&body)
+                .await
+                .map_err(From::from)
+        }
         #[cfg(feature = "as")]
         "attest" if request.method() == Method::POST => core
             .attestation_service
@@ -410,7 +436,41 @@ pub(crate) async fn api(
 
                 let claims = core.token_verifier.verify(token)?;
 
+                // A legacy/custom resource policy may only tighten the public
+                // mode contract. It cannot turn a warning token into a grant.
+                if plugin_name == "resource"
+                    && !crate::resource_policy::authorize(&claims, resource_path).await?
+                {
+                    KBS_POLICY_VIOLATIONS.inc();
+                    return Err(Error::PolicyDeny);
+                }
+
                 let claim_str = serde_json::to_string(&claims)?;
+
+                // Run before any backend call. A custom Rego policy can only
+                // further restrict the three-party contract.
+                if plugin_name == "resource" {
+                    if let Some(policy) = &core.config.cc_ai {
+                        // The implemented key-release topology is background
+                        // check. Do not accept a detached bearer passport here.
+                        #[cfg(feature = "as")]
+                        core.attestation_service
+                            .get_attest_token_from_session(&request)
+                            .await
+                            .map_err(|_| Error::PolicyDeny)?;
+                        if policy
+                            .authorize(
+                                &claims,
+                                &resource_path.join("/"),
+                                time::OffsetDateTime::now_utc().unix_timestamp(),
+                            )
+                            .is_err()
+                        {
+                            KBS_POLICY_VIOLATIONS.inc();
+                            return Err(Error::PolicyDeny);
+                        }
+                    }
+                }
 
                 KBS_POLICY_EVALS.inc();
                 // TODO: add policy filter support for other plugins
