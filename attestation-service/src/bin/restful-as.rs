@@ -3,7 +3,10 @@ use std::{net::SocketAddr, path::Path, sync::Arc};
 use actix_cors::Cors;
 use actix_web::{http::header, web, App, HttpResponse, HttpServer};
 use anyhow::Result;
-use attestation_service::{config::Config, config::ConfigError, AttestationService, ServiceError};
+use attestation_service::{
+    config::Config, config::ConfigError, inference::InferenceService, AttestationService,
+    ServiceError,
+};
 use clap::Parser;
 use openssl::{
     pkey::PKey,
@@ -198,30 +201,31 @@ loglevel: {env_filter}
 
     let storage_provider =
         key_value_storage::KvStorageProvider::new(config.storage_backend.clone());
-    let attestation_service = AttestationService::new(config, storage_provider).await?;
 
-    let inference = if cli.inference_only {
-        let endorsement = attestation_service.prepare_inference().await?;
-        Some(web::Data::new(restful::inference::InferenceState::new(
-            endorsement,
-            cli.inference_concurrency,
-        )))
+    let (inference, legacy) = if cli.inference_only {
+        let service = InferenceService::new(config, storage_provider).await?;
+        (
+            Some(web::Data::new(restful::inference::InferenceState::new(
+                service,
+                cli.inference_concurrency,
+            ))),
+            None,
+        )
     } else {
-        None
+        let service = AttestationService::new(config, storage_provider).await?;
+        (None, Some(web::Data::new(Arc::new(RwLock::new(service)))))
     };
 
     let allowed_origin = cli.allowed_origin;
-    let attestation_service = web::Data::new(Arc::new(RwLock::new(attestation_service)));
     let server = HttpServer::new(move || {
-        let mut app = App::new()
-            .wrap(configure_cors(&allowed_origin))
-            .app_data(web::Data::clone(&attestation_service));
+        let mut app = App::new().wrap(configure_cors(&allowed_origin));
         if let Some(state) = &inference {
             app = app
-                .app_data(web::Data::clone(state))
+                .app_data(state.clone())
                 .configure(restful::inference::configure);
-        } else {
-            app = app.configure(configure_legacy);
+        }
+        if let Some(service) = &legacy {
+            app = app.app_data(service.clone()).configure(configure_legacy);
         }
         app
     });

@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod ear_token;
+pub mod inference;
 pub mod rvps;
 use crate::rvps::RvpsClient;
 
@@ -13,8 +14,8 @@ pub use kbs_types::{Attestation, HashAlgorithm, Tee};
 use key_value_storage::KeyValueStorageError;
 pub use serde_json::Value;
 
-use anyhow::{anyhow, bail, Context, Result};
-use config::Config;
+use anyhow::{bail, Context, Result};
+use config::{Config, VerifierConfig};
 use jsonwebtoken::jwk::JwkSet;
 use key_value_storage::StorageProvider;
 use rvps::RvpsError;
@@ -121,30 +122,28 @@ pub struct VerificationRequest {
 }
 
 pub struct AttestationService {
-    config: Config,
     rvps: RvpsClient,
     token_broker: EarAttestationTokenBroker,
-    storage_provider: Arc<dyn StorageProvider>,
+    evidence_verifier: EvidenceVerifier,
 }
 
-fn verify_inference_tdx_claims(
-    tee: Tee,
-    claims: &[(TeeEvidenceParsedClaim, TeeClass)],
-) -> Result<()> {
-    let [(claim, class)] = claims else {
-        bail!("Inference requires exactly one verified CPU report");
-    };
-    if tee != Tee::Tdx
-        || class != "cpu"
-        || claim
-            .pointer("/td_attributes/debug")
-            .and_then(Value::as_bool)
-            != Some(false)
-        || claim["collateral_expiration_status"].as_str() != Some("0")
-    {
-        bail!("Inference requires native, non-debug TDX with valid collateral");
-    }
-    Ok(())
+async fn new_token_broker(
+    config: &Config,
+    storage: &dyn StorageProvider,
+) -> Result<EarAttestationTokenBroker> {
+    let policy_storage = storage
+        .get_or_register_with_type(
+            AS_POLICY_STORAGE_NAMESPACE,
+            config.storage_backend.storage_type,
+        )
+        .await
+        .context("initialize policy storage")?;
+    EarAttestationTokenBroker::new(config.attestation_token_broker.clone(), policy_storage).await
+}
+
+struct EvidenceVerifier {
+    config: Option<VerifierConfig>,
+    storage_provider: Arc<dyn StorageProvider>,
 }
 
 impl AttestationService {
@@ -170,22 +169,14 @@ impl AttestationService {
         .await
         .map_err(ServiceError::Rvps)?;
 
-        let policy_storage = storage_provider
-            .get_or_register_with_type(
-                AS_POLICY_STORAGE_NAMESPACE,
-                config.storage_backend.storage_type,
-            )
-            .await
-            .context("initialize policy storage")?;
-        let token_broker =
-            EarAttestationTokenBroker::new(config.attestation_token_broker.clone(), policy_storage)
-                .await?;
-
+        let token_broker = new_token_broker(&config, storage_provider.as_ref()).await?;
         Ok(Self {
-            config,
             rvps,
             token_broker,
-            storage_provider,
+            evidence_verifier: EvidenceVerifier {
+                config: config.verifier_config,
+                storage_provider,
+            },
         })
     }
 
@@ -228,55 +219,6 @@ impl AttestationService {
         self.token_broker.signer_evidence(request).await
     }
 
-    /// Called once before the inference-only HTTP listener is published.
-    pub async fn prepare_inference(
-        &self,
-    ) -> Result<trustee_attested_signer::inference::SignerEndorsement> {
-        if !cfg!(any(feature = "tdx-verifier", feature = "all-verifier")) {
-            bail!("Inference requires the native TDX verifier");
-        }
-        if self.config.storage_backend.storage_type
-            != key_value_storage::KeyValueStorageType::Memory
-            || self.config.rvps_config != rvps::RvpsConfig::default()
-        {
-            bail!("Inference requires local policy storage and its own governance snapshot");
-        }
-        let endorsement = self.token_broker.inference_endorsement().await?;
-        let verifier = verifier::to_verifier(
-            &Tee::Tdx,
-            self.config.verifier_config.clone(),
-            self.storage_provider.clone(),
-        )
-        .await?;
-        let claims = verifier
-            .evaluate(
-                endorsement.evidence.clone(),
-                &ReportData::Value(&endorsement.binding.report_data()?),
-                &InitDataHash::NotProvided,
-            )
-            .await
-            .context("verify this instance's signer Quote and CCEL before readiness")?;
-        verify_inference_tdx_claims(Tee::Tdx, &claims)?;
-        let rtmr3 = claims[0]
-            .0
-            .pointer("/quote/body/rtmr_3")
-            .and_then(Value::as_str);
-        if !rtmr3.is_some_and(|digest| digest.len() == 96 && digest.bytes().any(|b| b != b'0')) {
-            bail!("AS ELF measurement is missing");
-        }
-        Ok(endorsement)
-    }
-
-    pub fn inference_ready(&self) -> bool {
-        self.config
-            .attestation_token_broker
-            .self_attestation
-            .as_ref()
-            .is_some_and(|p| {
-                trustee_attested_signer::unix_time().is_ok_and(|now| now < p.governance.expires_at)
-            })
-    }
-
     pub fn get_signer_metadata(&self) -> Result<Value> {
         self.token_broker.signer_metadata()
     }
@@ -291,93 +233,21 @@ impl AttestationService {
         verification_requests: Vec<VerificationRequest>,
         policy_ids: Vec<String>,
     ) -> Result<String> {
-        self.evaluate_with_profile(verification_requests, policy_ids, false)
-            .await
-    }
-
-    pub async fn evaluate_inference(&self, request: VerificationRequest) -> Result<String> {
-        if !self.inference_ready() {
-            bail!("Inference governance unavailable");
-        }
-        self.evaluate_with_profile(vec![request], Vec::new(), true)
-            .await
-    }
-
-    async fn evaluate_with_profile(
-        &self,
-        verification_requests: Vec<VerificationRequest>,
-        policy_ids: Vec<String>,
-        inference: bool,
-    ) -> Result<String> {
-        let mut tee_claims: Vec<TeeClaims> = vec![];
-
         if verification_requests.is_empty() {
-            bail!("No verification requests provided.")
+            bail!("No verification requests provided.");
         }
-
-        for verification_request in verification_requests {
-            let verifier = verifier::to_verifier(
-                &verification_request.tee,
-                self.config.verifier_config.clone(),
-                self.storage_provider.clone(),
-            )
-            .await?;
-
-            let (report_data, runtime_data_claims) = parse_runtime_data(
-                verification_request.runtime_data,
-                &verification_request.runtime_data_hash_algorithm,
-            )
-            .context("parse runtime data")?;
-
-            let report_data = match &report_data {
-                Some(data) => ReportData::Value(data),
-                None => ReportData::NotProvided,
-            };
-
-            let (init_data, init_data_claims) =
-                parse_init_data(verification_request.init_data).context("parse init data")?;
-
-            let init_data_hash = match &init_data {
-                Some(data) => InitDataHash::Value(data),
-                None => InitDataHash::NotProvided,
-            };
-
-            let claims = verifier
-                .evaluate(verification_request.evidence, &report_data, &init_data_hash)
-                .await
-                .map_err(|e| anyhow!("Verifier evaluate failed: {e:?}"))?;
-
-            if inference {
-                verify_inference_tdx_claims(verification_request.tee, &claims)?;
-            }
-
-            for (claims_from_tee_evidence, tee_class) in claims {
-                info!(
-                    tee =? verification_request.tee,
-                    tee_class = tee_class,
-                    "Verifier/endorsement check passed.",
+        let mut tee_claims = Vec::new();
+        for request in verification_requests {
+            let claims = self.evidence_verifier.verify(request).await?;
+            for claim in &claims {
+                debug!(
+                    claims = %claim.claims,
+                    initdata = %claim.init_data_claims,
+                    runtime = %claim.runtime_data_claims,
+                    "Verified attestation claims",
                 );
-
-                if !inference {
-                    debug!(
-                        "claims = {}, initdata claims = {}, runtime claims = {}",
-                        serde_json::to_string(&claims_from_tee_evidence)?,
-                        serde_json::to_string(&init_data_claims)?,
-                        serde_json::to_string(&runtime_data_claims)?,
-                    );
-                }
-                tee_claims.push(TeeClaims {
-                    tee: verification_request.tee,
-                    tee_class,
-                    claims: claims_from_tee_evidence,
-                    init_data_claims: init_data_claims.clone(),
-                    runtime_data_claims: runtime_data_claims.clone(),
-                });
             }
-        }
-
-        if inference {
-            return self.token_broker.issue_inference(tee_claims).await;
+            tee_claims.extend(claims);
         }
         self.token_broker
             .issue(tee_claims, policy_ids, Some(self.rvps.clone()))
@@ -429,15 +299,51 @@ impl AttestationService {
         tee: Tee,
         tee_parameters: String,
     ) -> Result<String> {
-        let verifier = verifier::to_verifier(
-            &tee,
-            self.config.verifier_config.clone(),
-            self.storage_provider.clone(),
-        )
-        .await?;
+        let verifier = self.evidence_verifier.for_tee(&tee).await?;
         verifier
             .generate_supplemental_challenge(tee_parameters)
             .await
+    }
+}
+
+impl EvidenceVerifier {
+    async fn for_tee(&self, tee: &Tee) -> Result<Box<dyn verifier::Verifier + Send + Sync>> {
+        verifier::to_verifier(tee, self.config.clone(), self.storage_provider.clone())
+            .await
+            .map_err(|err| verifier::EvidenceUnavailable::from(err).into())
+    }
+
+    async fn verify(&self, request: VerificationRequest) -> Result<Vec<TeeClaims>> {
+        let verifier = self.for_tee(&request.tee).await?;
+        let (report_data, runtime_data_claims) =
+            parse_runtime_data(request.runtime_data, &request.runtime_data_hash_algorithm)
+                .context("parse runtime data")?;
+        let (init_data, init_data_claims) =
+            parse_init_data(request.init_data).context("parse init data")?;
+        let report_data = report_data
+            .as_deref()
+            .map_or(ReportData::NotProvided, ReportData::Value);
+        let init_data = init_data
+            .as_deref()
+            .map_or(InitDataHash::NotProvided, InitDataHash::Value);
+        let claims = verifier
+            .evaluate(request.evidence, &report_data, &init_data)
+            .await
+            .context("Verifier evaluate failed")?;
+
+        Ok(claims
+            .into_iter()
+            .map(|(claims, tee_class)| {
+                info!(tee = ?request.tee, tee_class, "Verifier/endorsement check passed.");
+                TeeClaims {
+                    tee: request.tee,
+                    tee_class,
+                    claims,
+                    init_data_claims: init_data_claims.clone(),
+                    runtime_data_claims: runtime_data_claims.clone(),
+                }
+            })
+            .collect())
     }
 }
 

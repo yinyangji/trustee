@@ -49,7 +49,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Governance {
     pub policy_hashes: BTreeMap<String, String>,
     pub reference_values: BTreeMap<String, Value>,
+    /// HTTPS audience scopes each tenant-facing service and its release IDs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inference_releases: BTreeMap<String, BTreeMap<String, InferenceReleaseReference>>,
     pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceReleaseReference {
+    pub application_rtmr3: String,
+    pub init_data_sha384: String,
 }
 
 impl Governance {
@@ -71,6 +81,38 @@ impl Governance {
             return Err(Error::Invalid(
                 "reference snapshot must contain nonempty arrays",
             ));
+        }
+        for (audience, releases) in &self.inference_releases {
+            inference::parse_audience(audience)?;
+            if releases.is_empty() {
+                return Err(Error::Invalid(
+                    "inference audience has no approved releases",
+                ));
+            }
+            for (release_id, reference) in releases {
+                if release_id.is_empty() || release_id.len() > 256 {
+                    return Err(Error::Invalid("invalid inference release ID"));
+                }
+                for (list, measured) in [
+                    ("application_rtmr_3", &reference.application_rtmr3),
+                    ("application_init_data", &reference.init_data_sha384),
+                ] {
+                    if !valid_hex(measured, 48)
+                        || !measured.bytes().any(|b| b != b'0')
+                        || !self
+                            .reference_values
+                            .get(list)
+                            .and_then(Value::as_array)
+                            .is_some_and(|values| {
+                                values.iter().any(|v| v.as_str() == Some(measured))
+                            })
+                    {
+                        return Err(Error::Invalid(
+                            "inference reference is outside the approved baseline",
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }

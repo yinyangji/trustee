@@ -54,7 +54,10 @@ impl Verifier for Tdx {
         let tdx_evidence = serde_json::from_value::<TdxEvidence>(evidence)
             .context("Deserialize TDX Evidence failed.")?;
 
-        let pcs = self.config.pcs()?;
+        let pcs = self
+            .config
+            .pcs()
+            .map_err(|err| EvidenceUnavailable::from(anyhow!(err)))?;
         let claims = verify_evidence(
             expected_report_data,
             expected_init_data_hash,
@@ -97,14 +100,16 @@ async fn verify_evidence(
         quote.tee_type(),
         cs,
     )
-    .await?;
+    .await
+    .map_err(EvidenceUnavailable::from)?;
 
     let quote_for_dcap = quote_bin.clone();
     let custom_claims = tokio::task::spawn_blocking(move || {
         ecdsa_quote_verification(&quote_for_dcap, Some(collateral))
     })
     .await
-    .context("DCAP verification worker failed")??;
+    .context("DCAP verification worker failed")
+    .map_err(EvidenceUnavailable::from)??;
 
     info!("Quote DCAP check succeeded.");
 

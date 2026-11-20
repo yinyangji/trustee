@@ -43,6 +43,7 @@ fn config() -> EarTokenConfiguration {
                     ("application_rtmr_3".into(), json!(["ab".repeat(48)])),
                     ("application_init_data".into(), json!(["fa".repeat(48)])),
                 ]),
+                inference_releases: Default::default(),
                 expires_at: trustee_attested_signer::unix_time().unwrap() + 3600,
             },
         }),

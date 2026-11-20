@@ -13,12 +13,14 @@ use openssl::{
     ssl::{SslAcceptor, SslMethod},
     x509::X509,
 };
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use trustee_attested_signer::inference::{require_tdx_evidence, InferenceBinding, RUNTIME_PROFILE};
+use trustee_attested_signer::inference::{
+    require_tdx_evidence, InferenceBinding, InferenceChallenge, EVIDENCE_PATH, INFERENCE_PATH,
+    RUNTIME_PROFILE,
+};
 
 #[derive(Parser)]
 struct Args {
@@ -36,19 +38,15 @@ struct Args {
     tls_cert: PathBuf,
     #[arg(long)]
     tls_key: PathBuf,
-    /// Tenant API authentication material, provisioned inside this guest.
+    /// Independent admission token for the evidence route.
+    #[arg(long)]
+    evidence_token_file: PathBuf,
+    /// Business API token, accepted only by the inference route.
     #[arg(long)]
     token_file: PathBuf,
     /// The trusted measurement loader's binary TCG event journal.
     #[arg(long, default_value = "/run/tdx-workload/events.bin")]
     journal: PathBuf,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Challenge {
-    nonce: String,
-    session_id: String,
 }
 
 struct Guest {
@@ -57,25 +55,26 @@ struct Guest {
     tls_spki_sha256: String,
     expected_rtmr3: Vec<u8>,
     events: Vec<u8>,
-    token: String,
+    evidence_token: String,
+    inference_token: String,
     quote_slot: Arc<Semaphore>,
     backend: reqwest::Client,
     backend_port: u16,
 }
 
-impl Guest {
-    fn authenticate(&self, request: &HttpRequest) -> bool {
-        request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|header| header.to_str().ok())
-            .and_then(|header| header.strip_prefix("Bearer "))
-            .is_some_and(|token| {
-                token.len() == self.token.len()
-                    && openssl::memcmp::eq(token.as_bytes(), self.token.as_bytes())
-            })
-    }
+fn authenticate(request: &HttpRequest, required: &str) -> bool {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            token.len() == required.len()
+                && openssl::memcmp::eq(token.as_bytes(), required.as_bytes())
+        })
+}
 
+impl Guest {
     fn measurement_is_current(&self) -> bool {
         fs::read(tdx_evidence::RTMR3).is_ok_and(|rtmr| rtmr == self.expected_rtmr3)
     }
@@ -94,7 +93,7 @@ impl Guest {
             .is_ok_and(|response| response.status().is_success())
     }
 
-    fn binding(&self, challenge: Challenge) -> InferenceBinding {
+    fn binding(&self, challenge: InferenceChallenge) -> InferenceBinding {
         InferenceBinding {
             profile: RUNTIME_PROFILE.into(),
             audience: self.audience.clone(),
@@ -117,13 +116,10 @@ async fn ready(guest: web::Data<Guest>) -> HttpResponse {
 async fn evidence(
     guest: web::Data<Guest>,
     request: HttpRequest,
-    challenge: web::Json<Challenge>,
+    challenge: web::Json<InferenceChallenge>,
 ) -> HttpResponse {
-    if !guest.authenticate(&request) {
+    if !authenticate(&request, &guest.evidence_token) {
         return HttpResponse::Unauthorized().finish();
-    }
-    if !guest.is_ready().await {
-        return HttpResponse::ServiceUnavailable().finish();
     }
     let binding = guest.binding(challenge.into_inner());
     let Ok(report_data) = binding.report_data() else {
@@ -132,6 +128,9 @@ async fn evidence(
     let Ok(permit) = guest.quote_slot.clone().try_acquire_owned() else {
         return HttpResponse::ServiceUnavailable().finish();
     };
+    if !guest.is_ready().await {
+        return HttpResponse::ServiceUnavailable().finish();
+    }
     let runtime = tokio::runtime::Handle::current();
     let quote = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -156,7 +155,7 @@ async fn evidence(
 }
 
 async fn infer(guest: web::Data<Guest>, request: HttpRequest, body: web::Bytes) -> HttpResponse {
-    if !guest.authenticate(&request) {
+    if !authenticate(&request, &guest.inference_token) {
         return HttpResponse::Unauthorized().finish();
     }
     if !guest.measurement_is_current() {
@@ -165,7 +164,7 @@ async fn infer(guest: web::Data<Guest>, request: HttpRequest, body: web::Bytes) 
     let Ok(response) = guest
         .backend
         .post(format!(
-            "http://127.0.0.1:{}/v1/chat/completions",
+            "http://127.0.0.1:{}{INFERENCE_PATH}",
             guest.backend_port
         ))
         .header("content-type", "application/json")
@@ -189,6 +188,21 @@ async fn infer(guest: web::Data<Guest>, request: HttpRequest, body: web::Bytes) 
     outgoing.streaming(response.bytes_stream())
 }
 
+fn load_token(path: PathBuf) -> Result<String> {
+    let mut bytes = String::new();
+    fs::File::open(path)?
+        .take(1025)
+        .read_to_string(&mut bytes)?;
+    let token = bytes.trim();
+    ensure!(
+        bytes.len() <= 1024
+            && (32..=512).contains(&token.len())
+            && token.bytes().all(|b| b.is_ascii_graphic()),
+        "invalid API token"
+    );
+    Ok(token.to_owned())
+}
+
 #[actix_web::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -206,10 +220,11 @@ async fn main() -> Result<()> {
         !events.is_empty() && events.len() <= max_events as usize,
         "Invalid TCG event journal length"
     );
-    let token = fs::read_to_string(args.token_file)?.trim().to_string();
+    let evidence_token = load_token(args.evidence_token_file)?;
+    let inference_token = load_token(args.token_file)?;
     ensure!(
-        token.len() >= 32 && token.len() <= 512 && token.bytes().all(|b| b.is_ascii_graphic()),
-        "Invalid tenant API token"
+        evidence_token != inference_token,
+        "evidence and inference credentials must differ"
     );
 
     let chain_path = args.tls_cert;
@@ -227,7 +242,8 @@ async fn main() -> Result<()> {
         tls_spki_sha256,
         expected_rtmr3,
         events,
-        token,
+        evidence_token,
+        inference_token,
         backend_port: args.backend_port,
         quote_slot: Arc::new(Semaphore::new(1)),
         backend: reqwest::Client::builder()
@@ -238,7 +254,7 @@ async fn main() -> Result<()> {
             .build()?,
     });
     guest
-        .binding(Challenge {
+        .binding(InferenceChallenge {
             nonce: "01".repeat(32),
             session_id: "02".repeat(32),
         })
@@ -253,12 +269,68 @@ async fn main() -> Result<()> {
             .app_data(web::PayloadConfig::new(2 * 1024 * 1024))
             .app_data(web::JsonConfig::default().limit(1024))
             .route("/readyz", web::get().to(ready))
-            .route("/attestation/evidence", web::post().to(evidence))
-            .route("/v1/chat/completions", web::post().to(infer))
+            .route(EVIDENCE_PATH, web::post().to(evidence))
+            .route(INFERENCE_PATH, web::post().to(infer))
     })
     .bind_openssl(args.socket, tls)
     .context("start the TDX guest HTTPS endpoint")?
     .run()
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{http::StatusCode, test};
+
+    #[actix_web::test]
+    async fn each_route_only_accepts_its_own_credential() {
+        let evidence_token = "e".repeat(32);
+        let inference_token = "i".repeat(32);
+        let guest = web::Data::new(Guest {
+            audience: "https://tenant.example".into(),
+            release_id: "r1".into(),
+            tls_spki_sha256: "aa".repeat(32),
+            expected_rtmr3: Vec::new(),
+            events: Vec::new(),
+            evidence_token: evidence_token.clone(),
+            inference_token: inference_token.clone(),
+            quote_slot: Arc::new(Semaphore::new(0)),
+            backend: reqwest::Client::new(),
+            backend_port: 1,
+        });
+        let app = test::init_service(
+            App::new()
+                .app_data(guest)
+                .route(EVIDENCE_PATH, web::post().to(evidence))
+                .route(INFERENCE_PATH, web::post().to(infer)),
+        )
+        .await;
+        for (route, token, expected) in [
+            (EVIDENCE_PATH, &inference_token, StatusCode::UNAUTHORIZED),
+            (INFERENCE_PATH, &evidence_token, StatusCode::UNAUTHORIZED),
+            (
+                EVIDENCE_PATH,
+                &evidence_token,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                INFERENCE_PATH,
+                &inference_token,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let request = test::TestRequest::post()
+                .uri(route)
+                .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
+                .set_json(json!({"nonce": "01".repeat(32), "session_id": "02".repeat(32)}))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                expected,
+                "{route}"
+            );
+        }
+    }
 }

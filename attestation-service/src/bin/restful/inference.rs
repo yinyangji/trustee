@@ -1,171 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::InitDataInput;
 use actix_web::{web, HttpResponse};
-use anyhow::{bail, ensure, Result};
-use attestation_service::{
-    AttestationService, HashAlgorithm, RuntimeData, Tee, VerificationRequest,
-};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use serde::Deserialize;
+use attestation_service::inference::{InferenceError, InferenceService};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::warn;
-use trustee_attested_signer::inference::{
-    require_tdx_evidence, InferenceBinding, InferenceResponse, SignerEndorsement,
-};
+use trustee_attested_signer::inference::{InferenceRequest, VERIFY_PATH};
 
 const DEADLINE: Duration = Duration::from_secs(5);
-pub(super) const BODY_LIMIT: usize = 1024 * 1024;
+const BODY_LIMIT: usize = 1024 * 1024;
 
 pub struct InferenceState {
-    endorsement: SignerEndorsement,
+    service: InferenceService,
     slots: Arc<Semaphore>,
 }
 
 impl InferenceState {
-    pub fn new(endorsement: SignerEndorsement, capacity: u16) -> Self {
+    pub fn new(service: InferenceService, capacity: u16) -> Self {
         Self {
-            endorsement,
+            service,
             slots: Arc::new(Semaphore::new(usize::from(capacity))),
         }
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InferenceRequest {
-    #[serde(default)]
-    known_signer_kids: Vec<String>,
-    attestation_request: InferenceAppraisal,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferenceAppraisal {
-    verification_requests: Vec<InferenceQuote>,
-    policy_ids: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferenceQuote {
-    tee: String,
-    evidence: String,
-    runtime_data: StructuredRuntime,
-    init_data: InitDataInput,
-    runtime_data_hash_algorithm: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StructuredRuntime {
-    structured: InferenceBinding,
-}
-
-impl InferenceRequest {
-    fn into_verified_shape(self, kid: &str) -> Result<(VerificationRequest, bool)> {
-        ensure!(
-            self.known_signer_kids.len() <= 16
-                && self.known_signer_kids.iter().all(|id| {
-                    id.len() == 64
-                        && id
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                }),
-            "invalid signer key hints"
-        );
-        let include_signer = !self.known_signer_kids.iter().any(|known| known == kid);
-        let mut request = self.attestation_request;
-        ensure!(
-            request.verification_requests.len() == 1
-                && request.policy_ids == ["default", "application"],
-            "inference requires one report and both policies"
-        );
-        let request = request.verification_requests.remove(0);
-        ensure!(request.tee == "tdx", "inference requires native TDX");
-        let binding = request.runtime_data.structured;
-        binding.validate()?;
-        let InitDataInput::InitDataToml(init_data) = request.init_data else {
-            bail!("inference requires structured InitData");
-        };
-        let parsed: attestation_service::Initdata = toml::from_str(&init_data)?;
-        ensure!(
-            matches!(parsed.algorithm, HashAlgorithm::Sha384)
-                && request
-                    .runtime_data_hash_algorithm
-                    .as_deref()
-                    .is_none_or(|a| a == "sha384"),
-            "TDX runtime and launch bindings require SHA-384"
-        );
-        let request = VerificationRequest {
-            tee: Tee::Tdx,
-            evidence: serde_json::from_slice(&URL_SAFE_NO_PAD.decode(request.evidence)?)?,
-            runtime_data: Some(RuntimeData::Structured(serde_json::to_value(binding)?)),
-            init_data: Some(attestation_service::InitDataInput::Toml(init_data)),
-            runtime_data_hash_algorithm: HashAlgorithm::Sha384,
-        };
-        require_tdx_evidence(&request.evidence)?;
-        ensure!(
-            !request.evidence.as_object().is_some_and(|object| {
-                object
-                    .keys()
-                    .any(|key| key != "quote" && key != "cc_eventlog")
-            }),
-            "unexpected evidence fields"
-        );
-        Ok((request, include_signer))
-    }
-}
-
-pub async fn readiness(service: web::Data<Arc<RwLock<AttestationService>>>) -> HttpResponse {
-    if service.read().await.inference_ready() {
+async fn readiness(state: web::Data<InferenceState>) -> HttpResponse {
+    if state.service.is_ready() {
         HttpResponse::Ok().finish()
     } else {
-        HttpResponse::ServiceUnavailable().finish()
+        unavailable()
     }
 }
 
-pub async fn verify(
+fn unavailable() -> HttpResponse {
+    HttpResponse::ServiceUnavailable()
+        .insert_header(("Retry-After", "1"))
+        .finish()
+}
+
+fn appraisal_failure(error: InferenceError) -> HttpResponse {
+    match error {
+        InferenceError::InvalidRequest(_) => HttpResponse::BadRequest().finish(),
+        InferenceError::Rejected(_) => HttpResponse::UnprocessableEntity().finish(),
+        InferenceError::Unavailable(_) => {
+            // Only log the error's public category. A dependency error may
+            // contain collateral endpoint data or platform identifiers.
+            warn!(%error, "Inference dependency could not complete appraisal");
+            unavailable()
+        }
+    }
+}
+
+async fn verify(
     request: web::Json<InferenceRequest>,
     state: web::Data<InferenceState>,
-    service: web::Data<Arc<RwLock<AttestationService>>>,
 ) -> HttpResponse {
     let Ok(permit) = state.slots.clone().try_acquire_owned() else {
-        return HttpResponse::ServiceUnavailable()
-            .insert_header(("Retry-After", "1"))
-            .finish();
+        return unavailable();
     };
-    if !service.read().await.inference_ready() {
-        return HttpResponse::ServiceUnavailable().finish();
-    }
-    let Ok((request, include_signer)) = request
-        .into_inner()
-        .into_verified_shape(&state.endorsement.binding.kid)
-    else {
-        return HttpResponse::BadRequest().finish();
-    };
-
-    // If the connection is dropped or times out, this task still owns the
-    // permit until verification (including native work) actually finishes.
+    // The evaluation retains admission until native work finishes, even
+    // when the HTTP client disconnects or its deadline expires.
     let evaluation = tokio::spawn(async move {
         let _permit = permit;
-        service.read().await.evaluate_inference(request).await
+        state.service.appraise(request.into_inner()).await
     });
     match tokio::time::timeout(DEADLINE, evaluation).await {
-        Ok(Ok(Ok(ear))) => HttpResponse::Ok()
+        Ok(Ok(Ok(response))) => HttpResponse::Ok()
             .insert_header(("Cache-Control", "no-store"))
-            .json(InferenceResponse {
-                ear,
-                signer_evidence: include_signer.then(|| state.endorsement.clone()),
-            }),
-        Ok(Ok(Err(_))) => {
-            warn!("Inference attestation appraisal was unsuccessful");
-            HttpResponse::UnprocessableEntity().finish()
-        }
-        _ => HttpResponse::ServiceUnavailable()
-            .insert_header(("Retry-After", "1"))
-            .finish(),
+            .json(response),
+        Ok(Ok(Err(error))) => appraisal_failure(error),
+        _ => unavailable(),
     }
 }
 
@@ -174,7 +78,7 @@ pub fn configure(config: &mut web::ServiceConfig) {
         .route("/healthz", web::get().to(HttpResponse::Ok))
         .route("/readyz", web::get().to(readiness))
         .service(
-            web::resource("/v1/verify")
+            web::resource(VERIFY_PATH)
                 .app_data(web::JsonConfig::default().limit(BODY_LIMIT))
                 .route(web::post().to(verify)),
         );
@@ -183,6 +87,7 @@ pub fn configure(config: &mut web::ServiceConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use serde_json::{json, Value};
     use trustee_attested_signer::inference::RUNTIME_PROFILE;
 
@@ -208,21 +113,20 @@ mod tests {
         })
     }
 
-    fn parse(value: Value, kid: &str) -> Result<(VerificationRequest, bool)> {
-        serde_json::from_value::<InferenceRequest>(value)?.into_verified_shape(kid)
+    fn parse(value: Value, kid: &str) -> anyhow::Result<bool> {
+        let request: InferenceRequest = serde_json::from_value(value)?;
+        Ok(request.decode(kid)?.include_signer)
     }
 
     #[test]
     fn only_exact_tdx_and_dual_policy_profile_is_admitted() {
-        let kids = "aa".repeat(32);
-        let (parsed, include) = parse(request(), &kids).unwrap();
-        assert_eq!(parsed.tee, Tee::Tdx);
-        assert!(include);
+        let kid = "aa".repeat(32);
+        assert!(parse(request(), &kid).unwrap());
 
         let mut known = request();
-        known["known_signer_kids"] = json!([kids]);
-        assert!(!parse(known.clone(), &kids).unwrap().1);
-        assert!(parse(known, &"ff".repeat(32)).unwrap().1);
+        known["known_signer_kids"] = json!([kid]);
+        assert!(!parse(known.clone(), &kid).unwrap());
+        assert!(parse(known, &"ff".repeat(32)).unwrap());
 
         let prefix = "/attestation_request/verification_requests/0";
         for (path, replacement) in [
@@ -243,11 +147,30 @@ mod tests {
         ] {
             let mut invalid = request();
             *invalid.pointer_mut(&path).unwrap() = replacement;
-            assert!(parse(invalid, &kids).is_err(), "{path}");
+            assert!(parse(invalid, &kid).is_err(), "{path}");
         }
         let mut gpu = request();
         gpu.pointer_mut(prefix).unwrap()["gpu_evidence"] = json!({});
-        assert!(parse(gpu, &kids).is_err());
+        assert!(parse(gpu, &kid).is_err());
+    }
+
+    #[test]
+    fn temporary_appraisal_failure_has_retry_after() {
+        let temporary =
+            appraisal_failure(InferenceError::Unavailable(anyhow::anyhow!("PCCS failed")));
+        assert_eq!(
+            temporary.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(temporary.headers().get("Retry-After").unwrap(), "1");
+
+        let rejected =
+            appraisal_failure(InferenceError::Rejected(anyhow::anyhow!("policy rejected")));
+        assert_eq!(
+            rejected.status(),
+            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(rejected.headers().get("Retry-After").is_none());
     }
 
     #[actix_web::test]

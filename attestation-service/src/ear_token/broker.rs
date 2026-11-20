@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use serde_variant::to_variant_name;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tracing::{debug, info, warn};
 
@@ -37,6 +37,7 @@ pub const EXTENSIONS_RULE: &str = "data.policy.extensions";
 
 pub struct EarAttestationTokenBroker {
     config: EarTokenConfiguration,
+    attested: Option<AttestedGovernance>,
     private_key: EcKey<Private>,
     cert_url: Option<String>,
     cert_chain: Option<Vec<X509>>,
@@ -45,12 +46,31 @@ pub struct EarAttestationTokenBroker {
     signer_evidence_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
+struct AttestedGovernance {
+    as_release_manifest_digest: String,
+    snapshot: Arc<trustee_attested_signer::Governance>,
+    digest: String,
+}
+
+impl AttestedGovernance {
+    fn check_expiry(&self) -> Result<()> {
+        if self.snapshot.expires_at <= trustee_attested_signer::unix_time()? {
+            bail!("attested governance expired");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("policy {0} returned a non-affirming appraisal")]
+pub(crate) struct PolicyRejected(String);
+
 impl EarAttestationTokenBroker {
     pub async fn new(
-        config: EarTokenConfiguration,
+        mut config: EarTokenConfiguration,
         storage: KeyValueStorageInstance,
     ) -> Result<Self> {
-        if let Some(profile) = &config.self_attestation {
+        let attested = if let Some(profile) = config.self_attestation.take() {
             if !cfg!(feature = "tdx-self-attestation") {
                 bail!("Self-attestation requires the tdx-self-attestation build feature");
             }
@@ -61,7 +81,14 @@ impl EarAttestationTokenBroker {
             {
                 bail!("Self-attestation requires an ephemeral signer, a 1..=5 minute lifetime, and no legacy CC-AI job profile");
             }
-        }
+            Some(AttestedGovernance {
+                as_release_manifest_digest: profile.as_release_manifest_digest,
+                digest: profile.governance.digest()?,
+                snapshot: Arc::new(profile.governance),
+            })
+        } else {
+            None
+        };
         if let Some(trust) = &config.cc_ai {
             trust.validate()?;
         }
@@ -105,6 +132,7 @@ impl EarAttestationTokenBroker {
             return Ok(Self {
                 private_key: EcKey::generate(&group)?,
                 config,
+                attested,
                 cert_url: None,
                 cert_chain: None,
                 policy_engine,
@@ -138,6 +166,7 @@ impl EarAttestationTokenBroker {
 
         Ok(Self {
             config,
+            attested,
             private_key,
             cert_url: signer.cert_url,
             cert_chain,
@@ -163,6 +192,11 @@ pub struct EvaluationResult {
     pub policy_hash: String,
 }
 
+enum EvidenceDisclosure {
+    Full,
+    RuntimeBinding,
+}
+
 impl EarAttestationTokenBroker {
     pub(crate) async fn issue(
         &self,
@@ -170,29 +204,36 @@ impl EarAttestationTokenBroker {
         policy_ids: Vec<String>,
         rvps_client: Option<RvpsClient>,
     ) -> Result<String> {
-        self.issue_with_profile(all_tee_claims, policy_ids, rvps_client, false)
-            .await
-    }
-
-    pub(crate) async fn issue_inference(&self, tee_claims: Vec<TeeClaims>) -> Result<String> {
-        self.issue_with_profile(
-            tee_claims,
-            vec!["default".into(), "application".into()],
-            None,
-            true,
+        self.issue_with_disclosure(
+            all_tee_claims,
+            policy_ids,
+            rvps_client,
+            EvidenceDisclosure::Full,
         )
         .await
     }
 
-    async fn issue_with_profile(
+    pub(crate) async fn issue_inference(&self, tee_claim: TeeClaims) -> Result<String> {
+        self.issue_with_disclosure(
+            vec![tee_claim],
+            trustee_attested_signer::inference::POLICY_IDS
+                .map(String::from)
+                .into(),
+            None,
+            EvidenceDisclosure::RuntimeBinding,
+        )
+        .await
+    }
+
+    async fn issue_with_disclosure(
         &self,
         all_tee_claims: Vec<TeeClaims>,
         policy_ids: Vec<String>,
         rvps_client: Option<RvpsClient>,
-        inference: bool,
+        disclosure: EvidenceDisclosure,
     ) -> Result<String> {
-        if let Some(profile) = &self.config.self_attestation {
-            profile.governance.validate()?;
+        if let Some(profile) = &self.attested {
+            profile.check_expiry()?;
             if all_tee_claims.is_empty()
                 || all_tee_claims
                     .iter()
@@ -238,12 +279,12 @@ impl EarAttestationTokenBroker {
                     .evaluate_policy(&actual_id, &tcb_claims_json, &rvps_client)
                     .await
                     .with_context(|| format!("Evaluate policy {actual_id}"))?;
-                if let Some(profile) = &self.config.self_attestation {
-                    if profile.governance.policy_hashes.get(&actual_id) != Some(&hash)
-                        || evaluated.status != ear::TrustTier::Affirming
-                    {
-                        warn!(policy_id = %actual_id, policy_hash = %hash, status = %evaluated.status.as_str(), "Attested signer refused policy result");
-                        bail!("Attested signer rejected unapproved or non-affirming policy {actual_id}");
+                if let Some(profile) = &self.attested {
+                    if profile.snapshot.policy_hashes.get(&actual_id) != Some(&hash) {
+                        bail!("Attested signer rejected unapproved policy {actual_id}");
+                    }
+                    if evaluated.status != ear::TrustTier::Affirming {
+                        return Err(PolicyRejected(actual_id).into());
                     }
                 }
                 results.push(json!({
@@ -269,7 +310,7 @@ impl EarAttestationTokenBroker {
                     }
                 }
             }
-            if policy_ids.len() > 1 || self.config.self_attestation.is_some() {
+            if policy_ids.len() > 1 || self.attested.is_some() {
                 let value: RawValue = serde_json::from_value(json!(results))?;
                 appraisal
                     .extensions
@@ -278,7 +319,7 @@ impl EarAttestationTokenBroker {
                     .extensions
                     .set_by_name("ear.trustee.policy-results", value)?;
             }
-            if inference {
+            if matches!(disclosure, EvidenceDisclosure::RuntimeBinding) {
                 let runtime = tcb_claims
                     .get("runtime_data_claims")
                     .cloned()
@@ -318,7 +359,7 @@ impl EarAttestationTokenBroker {
         extensions.register("iss", 1, RawValueKind::String)?;
         extensions.set_by_name("iss", RawValue::String(self.config.issuer_name.clone()))?;
 
-        if let Some(profile) = &self.config.self_attestation {
+        if let Some(profile) = &self.attested {
             if submods
                 .values()
                 .any(|appraisal| appraisal.status != ear::TrustTier::Affirming)
@@ -326,13 +367,13 @@ impl EarAttestationTokenBroker {
                 bail!("Attested signer refuses non-affirming appraisals");
             }
             exp = exp.min(OffsetDateTime::from_unix_timestamp(
-                profile.governance.expires_at,
+                profile.snapshot.expires_at,
             )?);
             extensions.set_by_name("exp", RawValue::Integer(exp.unix_timestamp()))?;
             extensions.register("ear.trustee.signer-governance", -712, RawValueKind::String)?;
             extensions.set_by_name(
                 "ear.trustee.signer-governance",
-                RawValue::String(profile.governance.digest()?),
+                RawValue::String(profile.digest.clone()),
             )?;
         }
 
@@ -410,16 +451,13 @@ impl EarAttestationTokenBroker {
         let pkey = PKey::from_ec_key(self.private_key.clone())?;
         let private_key_bytes = zeroize::Zeroizing::new(pkey.private_key_to_pem_pkcs8()?);
 
-        if let Some(profile) = &self.config.self_attestation {
-            profile.governance.validate()?;
-            if exp <= OffsetDateTime::now_utc() {
-                bail!("Attested signer refuses an already expired result");
-            }
+        if self.attested.is_some() && exp <= OffsetDateTime::now_utc() {
+            bail!("Attested signer refuses an already expired result");
         }
 
         let signed_ear = ear.sign_jwt_pem_with_header(&jwt_header, &private_key_bytes)?;
-        if let Some(profile) = &self.config.self_attestation {
-            info!(kid = ?jwt_header.kid, governance_digest = %profile.governance.digest()?, policies = ?policy_ids, "Attested passport issued");
+        if let Some(profile) = &self.attested {
+            info!(kid = ?jwt_header.kid, governance_digest = %profile.digest, policies = ?policy_ids, "Attested passport issued");
         }
 
         Ok(signed_ear)
@@ -433,13 +471,9 @@ impl EarAttestationTokenBroker {
     ) -> Result<(Appraisal, String)> {
         let mut appraisal = Appraisal::new();
         let mut extensions = vec![];
-        if rvps_client.is_some() || self.config.self_attestation.is_some() {
+        if rvps_client.is_some() || self.attested.is_some() {
             let rvps_client = rvps_client.clone();
-            let snapshot = self
-                .config
-                .self_attestation
-                .as_ref()
-                .map(|p| p.governance.reference_values.clone());
+            let snapshot = self.attested.as_ref().map(|p| Arc::clone(&p.snapshot));
             let extension = RegorusExtension {
                 name: "query_reference_value".to_string(),
                 id: 1,
@@ -452,7 +486,7 @@ impl EarAttestationTokenBroker {
                         .context("query_reference_value extension parameter must be a string")?
                         .to_string();
                     if let Some(snapshot) = &snapshot {
-                        let value = snapshot.get(&id).with_context(|| {
+                        let value = snapshot.reference_values.get(&id).with_context(|| {
                             format!("Reference {id} is not in the approved snapshot")
                         })?;
                         return serde_json::from_value(value.clone()).map_err(Error::from);
@@ -573,7 +607,7 @@ impl EarAttestationTokenBroker {
     }
 
     pub async fn set_policy(&self, policy_id: String, policy: String) -> Result<()> {
-        if self.config.self_attestation.is_some() {
+        if self.attested.is_some() {
             bail!("Attested signer policies are immutable; publish a new approved governance snapshot");
         }
         self.policy_engine
@@ -611,8 +645,7 @@ impl EarAttestationTokenBroker {
     }
 
     fn signer_kid(&self) -> Result<Option<String>> {
-        self.config
-            .self_attestation
+        self.attested
             .as_ref()
             .map(|_| self.signing_key()?.kid().map_err(Error::from))
             .transpose()
@@ -626,11 +659,10 @@ impl EarAttestationTokenBroker {
     ) -> Result<trustee_attested_signer::SignerEvidenceBundle> {
         request.validate()?;
         let profile = self
-            .config
-            .self_attestation
+            .attested
             .as_ref()
             .context("AS self-attestation is disabled")?;
-        profile.governance.validate()?;
+        profile.check_expiry()?;
         let signing_key = self.signing_key()?;
         let kid = signing_key.kid()?;
         if request.kid != kid {
@@ -643,7 +675,7 @@ impl EarAttestationTokenBroker {
             instance_id: kid.clone(),
             signing_spki_sha256: kid,
             as_release_manifest_digest: profile.as_release_manifest_digest.clone(),
-            governance_profile_digest: profile.governance.digest()?,
+            governance_profile_digest: profile.digest.clone(),
             verifier_nonce: request.nonce,
         };
         let evidence = self.native_signer_evidence(binding.report_data()?).await?;
@@ -654,23 +686,29 @@ impl EarAttestationTokenBroker {
         })
     }
 
+    pub(crate) fn governance(&self) -> Option<&trustee_attested_signer::Governance> {
+        self.attested.as_ref().map(|p| p.snapshot.as_ref())
+    }
+
     pub(crate) async fn inference_endorsement(
         &self,
     ) -> Result<trustee_attested_signer::inference::SignerEndorsement> {
         use sha2::{Digest, Sha384};
         use trustee_attested_signer::inference::{
             require_tdx_evidence, EndorsementBinding, SignerEndorsement, ENDORSEMENT_DOMAIN,
+            POLICY_IDS,
         };
 
-        let profile =
-            self.config.self_attestation.as_ref().context(
-                "Inference requires an ephemeral attested signer and approved governance",
-            )?;
-        profile.governance.validate()?;
-        for id in ["default_cpu", "application_cpu"] {
-            let policy = self.policy_engine.get_policy(id).await?;
+        let profile = self
+            .attested
+            .as_ref()
+            .context("Inference requires an ephemeral attested signer and approved governance")?;
+        profile.check_expiry()?;
+        for id in POLICY_IDS {
+            let id = format!("{id}_cpu");
+            let policy = self.policy_engine.get_policy(&id).await?;
             let digest = hex::encode(Sha384::digest(policy.as_bytes()));
-            if profile.governance.policy_hashes.get(id) != Some(&digest) {
+            if profile.snapshot.policy_hashes.get(&id) != Some(&digest) {
                 bail!("Inference policy {id} does not match the approved snapshot");
             }
         }
@@ -684,11 +722,11 @@ impl EarAttestationTokenBroker {
             instance_id: kid.clone(),
             signing_spki_sha256: kid,
             as_release_manifest_digest: profile.as_release_manifest_digest.clone(),
-            governance_profile_digest: profile.governance.digest()?,
+            governance_profile_digest: profile.digest.clone(),
         };
         let evidence = self.native_signer_evidence(binding.report_data()?).await?;
         require_tdx_evidence(&evidence)?;
-        profile.governance.validate()?;
+        profile.check_expiry()?;
 
         Ok(SignerEndorsement {
             binding,
@@ -727,8 +765,7 @@ impl EarAttestationTokenBroker {
     }
 
     pub fn signer_metadata(&self) -> Result<Value> {
-        self.config
-            .self_attestation
+        self.attested
             .as_ref()
             .context("AS self-attestation is disabled")?;
         let issuer = &self.config.issuer_name;

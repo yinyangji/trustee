@@ -8,6 +8,11 @@ use key_value_storage::StorageProvider;
 use serde::Deserialize;
 use tracing::debug;
 
+/// A verifier dependency or worker could not service the request.
+#[derive(Debug, thiserror::Error)]
+#[error("evidence verification is unavailable")]
+pub struct EvidenceUnavailable(#[from] anyhow::Error);
+
 pub mod sample;
 pub mod sample_device;
 

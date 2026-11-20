@@ -330,14 +330,37 @@ fn governance_digest_commits_to_actual_reference_values() {
     let mut governance = Governance {
         policy_hashes: BTreeMap::from([("application_cpu".into(), "aa".repeat(48))]),
         reference_values: BTreeMap::from([("application_rtmr_3".into(), json!(["bb".repeat(48)]))]),
+        inference_releases: BTreeMap::new(),
         expires_at: unix_time().unwrap() + 3600,
     };
     governance.validate().unwrap();
+    assert!(serde_json::to_value(&governance)
+        .unwrap()
+        .get("inference_releases")
+        .is_none());
     let initial = governance.digest().unwrap();
     governance
         .reference_values
-        .insert("application_rtmr_3".into(), json!(["cc".repeat(48)]));
+        .insert("application_init_data".into(), json!(["dd".repeat(48)]));
     assert_ne!(initial, governance.digest().unwrap());
+    let baseline_digest = governance.digest().unwrap();
+    governance.inference_releases = BTreeMap::from([(
+        "https://tenant.example".into(),
+        BTreeMap::from([(
+            "r1".into(),
+            InferenceReleaseReference {
+                application_rtmr3: "bb".repeat(48),
+                init_data_sha384: "dd".repeat(48),
+            },
+        )]),
+    )]);
+    governance.validate().unwrap();
+    assert_ne!(baseline_digest, governance.digest().unwrap());
+    governance
+        .reference_values
+        .insert("application_rtmr_3".into(), json!(["cc".repeat(48)]));
+    assert!(governance.validate().is_err());
+    governance.inference_releases.clear();
     governance.expires_at = unix_time().unwrap() - 1;
     assert!(governance.validate().is_err());
 }

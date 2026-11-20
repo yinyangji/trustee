@@ -232,6 +232,15 @@ and the approved governance snapshot. The policy hashes are the SHA-384 of the
 exact built-in `ear_default_policy_cpu.rego` and
 `ear_application_policy_cpu.rego` bytes. Their snapshot IDs are `default_cpu`
 and `application_cpu`. Include all the reference values used by both policies.
+
+For inference, set `governance.inference_releases` to an object keyed first by
+the exact tenant-facing HTTPS audience and then by `release_id`. Each entry
+requires `application_rtmr3` and `init_data_sha384`, both 96-character lowercase
+hex digests present in the corresponding reference values. Assign distinct
+audiences to services that require tenant isolation. The AS matches both
+measured values against the same record before signing. Approve and distribute
+the new governance digest with the tenant's trust and release files. Earlier
+inference-only configurations require this new field before starting.
 The launcher verifies the mounted release files and writes the RTMR3 event
 before executing the server. The approved InitData must bind the actual launcher,
 immutable filesystem, launch arguments, and restrictive agent policy.
@@ -246,7 +255,9 @@ TOML and the complete CCEL. An optional `known_signer_kids` array lets the
 selected replica omit its endorsement when the client has a valid cached copy.
 A successful result is a JSON object with `ear` and optional
 `signer_evidence`. Clients must verify both the signer and the fresh EAR
-against local trust and the actual inference connection.
+against local trust and the actual inference connection. Use 400 for invalid
+requests and 422 for attestation or policy rejection. A temporary dependency
+failure, deadline, or admission limit returns 503 with `Retry-After`.
 
 Build the guest tools and client with the following commands.
 
@@ -256,14 +267,19 @@ cargo build --locked -p trustee-attested-signer --features inference-cli --bins
 ```
 
 Run `tdx-inference-guest` in the measured guest. Its backend must listen only on
-the same guest's loopback interface and provide `GET /health` for readiness. Supply the guest's own certificate and key,
-tenant API token, measured workload event journal, approved application RTMR3,
-audience and release ID. The client obtains evidence and sends the optional
-OpenAI-compatible request on a single pinned HTTPS connection.
+the same guest's loopback interface and provide `GET /health` for readiness.
+Supply the guest's certificate and key, measured workload event journal,
+approved application RTMR3, audience and release ID. Provision a distinct
+admission token using `--evidence-token-file` and a business credential using
+`--token-file`. The evidence route accepts only the admission token. The client
+sends the business credential and optional OpenAI-compatible request over the
+same HTTPS connection after successful attestation. Only the admission token is
+required for evidence-only clients.
 
 ```bash
 verify-inference --trust signer-trust.json --release inference-release.json \
-  --init-data approved-initdata.toml --token-file tenant-token \
+  --init-data approved-initdata.toml --evidence-token-file evidence-token \
+  --token-file tenant-token \
   --prompt-request request.json
 ```
 

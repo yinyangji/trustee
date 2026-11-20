@@ -8,7 +8,7 @@ publish = false
 # Fault injection for isolated integration tests; never bypasses verification.
 integration-test = []
 as-launch = ["dep:serde"]
-inference-guest = ["dep:actix-web", "dep:openssl", "dep:serde", "dep:trustee-attested-signer", "reqwest/stream"]
+inference-guest = ["dep:actix-web", "dep:openssl", "dep:trustee-attested-signer", "reqwest/stream"]
 
 [[bin]]
 name = "tdx-inference-guest"

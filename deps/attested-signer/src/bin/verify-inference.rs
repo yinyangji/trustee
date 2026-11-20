@@ -7,15 +7,17 @@ use hyper::{body::Bytes, client::conn::http1, header, Request};
 use hyper_util::rt::TokioIo;
 use openssl::ssl::{SslConnector, SslMethod};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin, time::Duration};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tokio_openssl::SslStream;
 use trustee_attested_signer::{
-    inference::{InferenceBinding, InferenceRelease, InferenceResponse, InferenceSession},
+    inference::{
+        parse_audience, InferenceBinding, InferenceChallenge, InferenceRelease, InferenceResponse,
+        InferenceSession, EVIDENCE_PATH, INFERENCE_PATH, VERIFY_PATH,
+    },
     SignerTrustPolicy,
 };
-use url::Url;
 
 mod common;
 
@@ -30,8 +32,12 @@ struct Args {
     release: PathBuf,
     #[arg(long)]
     init_data: PathBuf,
+    /// Independent admission token for the evidence route.
     #[arg(long)]
-    token_file: PathBuf,
+    evidence_token_file: PathBuf,
+    /// Business credential sent only after the connection passes attestation.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
     /// Optional trust anchor for the inference service's HTTPS certificate.
     #[arg(long)]
     guest_ca: Option<PathBuf>,
@@ -39,7 +45,7 @@ struct Args {
     #[arg(long)]
     as_ca: Option<PathBuf>,
     /// Normal OpenAI-compatible request JSON to submit after successful appraisal.
-    #[arg(long)]
+    #[arg(long, requires = "token_file")]
     prompt_request: Option<PathBuf>,
 }
 
@@ -76,29 +82,62 @@ async fn read_body(mut body: hyper::body::Incoming, max: usize) -> Result<Vec<u8
     Ok(bytes)
 }
 
+fn load_token(path: &std::path::Path) -> Result<String> {
+    let bytes = common::read_limited(path, 1024)?;
+    let token = std::str::from_utf8(&bytes)?.trim();
+    ensure!(
+        (32..=512).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic()),
+        "invalid API token"
+    );
+    Ok(token.to_owned())
+}
+
+fn post_json(
+    authority: &str,
+    path: &str,
+    token: &str,
+    body: Vec<u8>,
+) -> Result<Request<Full<Bytes>>> {
+    Ok(Request::post(path)
+        .header(header::HOST, authority)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Full::new(Bytes::from(body)))?)
+}
+
+fn evidence_request(
+    authority: &str,
+    admission_token: &str,
+    binding: &InferenceBinding,
+) -> Result<Request<Full<Bytes>>> {
+    post_json(
+        authority,
+        EVIDENCE_PATH,
+        admission_token,
+        serde_json::to_vec(&InferenceChallenge {
+            nonce: binding.nonce.clone(),
+            session_id: binding.session_id.clone(),
+        })?,
+    )
+}
+
 /// One verified TLS connection is used for both requests. Hyper's connection-
 /// level sender cannot reconnect or send the inference request to a new peer.
 async fn verify_then_infer(args: Args) -> Result<()> {
     let trust: SignerTrustPolicy = common::read_json(&args.trust)?;
     trust.validate()?;
     let release: Release = common::read_json(&args.release)?;
-    let target = Url::parse(&release.audience)?;
-    ensure!(
-        target.scheme() == "https"
-            && target.path() == "/"
-            && target.query().is_none()
-            && target.fragment().is_none()
-            && target.username().is_empty()
-            && target.password().is_none(),
-        "expected audience must be an HTTPS origin"
-    );
+    let target = parse_audience(&release.audience)?;
     let hostname = target.host_str().context("missing HTTPS hostname")?;
     let port = target
         .port_or_known_default()
         .context("missing HTTPS port")?;
-    let token = common::read_limited(&args.token_file, 1024)?;
-    let token = std::str::from_utf8(&token)?.trim();
-    ensure!(!token.is_empty(), "missing tenant API token");
+    let evidence_token = load_token(&args.evidence_token_file)?;
+    let inference_token = args.token_file.as_deref().map(load_token).transpose()?;
+    ensure!(
+        inference_token.as_ref() != Some(&evidence_token),
+        "evidence and inference credentials must differ"
+    );
 
     let mut connector = SslConnector::builder(SslMethod::tls_client())?;
     if let Some(path) = &args.guest_ca {
@@ -117,21 +156,10 @@ async fn verify_then_infer(args: Args) -> Result<()> {
     let (mut sender, connection) = http1::handshake(TokioIo::new(tls)).await?;
     let connection = tokio::spawn(connection);
     let host = target.authority();
-    let request = |path: &str, body: Vec<u8>| {
-        Request::post(path)
-            .header(header::HOST, host)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Full::new(Bytes::from(body)))
-    };
-
     let session = InferenceSession::new(release.audience, release.release_id, &peer_key)?;
     let binding = session.binding();
     let result = sender
-        .send_request(request(
-            "/attestation/evidence",
-            serde_json::to_vec(&json!({"nonce":binding.nonce, "session_id":binding.session_id}))?,
-        )?)
+        .send_request(evidence_request(host, &evidence_token, binding)?)
         .await?;
     ensure!(
         result.status().is_success(),
@@ -158,7 +186,7 @@ async fn verify_then_infer(args: Args) -> Result<()> {
     }
     let mut response = client
         .build()?
-        .post(format!("{}/v1/verify", trust.issuer))
+        .post(format!("{}{VERIFY_PATH}", trust.issuer))
         .json(&appraisal)
         .send()
         .await?
@@ -194,8 +222,11 @@ async fn verify_then_infer(args: Args) -> Result<()> {
 
     if let Some(path) = &args.prompt_request {
         let prompt = common::read_limited(path, MAX_PROOF)?;
+        let token = inference_token
+            .as_deref()
+            .context("missing inference credential")?;
         let response = sender
-            .send_request(request("/v1/chat/completions", prompt)?)
+            .send_request(post_json(host, INFERENCE_PATH, token, prompt)?)
             .await?;
         ensure!(
             response.status().is_success(),
@@ -220,4 +251,27 @@ async fn main() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(300), verify_then_infer(Args::parse()))
         .await
         .context("inference session deadline exceeded")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_request_carries_only_the_admission_credential() {
+        let binding = InferenceBinding {
+            profile: trustee_attested_signer::inference::RUNTIME_PROFILE.into(),
+            audience: "https://guest.example".into(),
+            nonce: "01".repeat(32),
+            session_id: "02".repeat(32),
+            release_id: "r1".into(),
+            tls_spki_sha256: "03".repeat(32),
+        };
+        let request = evidence_request("guest.example", &"e".repeat(32), &binding).unwrap();
+        assert_eq!(request.uri().path(), EVIDENCE_PATH);
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            format!("Bearer {}", "e".repeat(32))
+        );
+    }
 }

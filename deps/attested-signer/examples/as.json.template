@@ -17,6 +17,14 @@
           "application_rtmr_3": ["<approved-workload-application-measurement>"],
           "application_init_data": ["<approved-restrictive-workload-InitData-hash>"]
         },
+        "inference_releases": {
+          "https://tenant-service.example.com": {
+            "release-v1": {
+              "application_rtmr3": "<approved-workload-application-measurement>",
+              "init_data_sha384": "<approved-restrictive-workload-InitData-hash>"
+            }
+          }
+        },
         "expires_at": 0
       }
     }
