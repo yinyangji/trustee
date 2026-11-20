@@ -7,8 +7,24 @@ publish = false
 [features]
 # Fault injection for isolated integration tests; never bypasses verification.
 integration-test = []
+as-launch = ["dep:serde"]
+inference-guest = ["dep:actix-web", "dep:openssl", "dep:serde", "dep:trustee-attested-signer", "reqwest/stream"]
+
+[[bin]]
+name = "tdx-inference-guest"
+path = "src/inference_guest.rs"
+required-features = ["inference-guest"]
+
+[[bin]]
+name = "tdx-as-launch"
+path = "src/as_launch.rs"
+required-features = ["as-launch"]
 
 [dependencies]
+actix-web = { workspace = true, features = ["openssl"], optional = true }
+openssl = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+trustee-attested-signer = { path = "../../deps/attested-signer", optional = true }
 anyhow.workspace = true
 attester = { git = "https://github.com/confidential-containers/guest-components.git", rev = "da8d93f2797088a5f0636c8c1eeb31da73784fe8", default-features = false, features = ["tdx-attester"] }
 base64.workspace = true

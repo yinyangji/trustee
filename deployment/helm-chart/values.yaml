@@ -209,6 +209,8 @@ as:
     pullPolicy: Always
     # -- AS container image tag.
     tag: "latest"
+    # -- Immutable shared AS image digest. Required when verifyAs is enabled.
+    digest: ""
   # -- Optional image pull secrets for private registries.
   imagePullSecrets: []
   verifier:
@@ -283,6 +285,30 @@ as:
   affinity: {}
   # -- Tolerations for scheduling AS Pods onto tainted nodes.
   tolerations: []
+
+# -- Independent inference appraisal deployment in native TDX guests.
+verifyAs:
+  enabled: false
+  replicaCount: 3
+  # -- Native TDX RuntimeClass. Set to the installed Kata handler.
+  runtimeClassName: ""
+  # -- Names of existing immutable configuration and TLS Secrets.
+  configSecretName: ""
+  tlsSecretName: ""
+  # -- The approved manifest and starting measurement must be bound by InitData.
+  launchManifestSecretName: ""
+  initialRtmr3: ""
+  concurrency: 8
+  # -- Approved launch InitData and associated workload annotations.
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    requests:
+      cpu: "2"
+      memory: 512Mi
+    limits:
+      memory: 2Gi
 
 rvps:
   # -- Number of RVPS Pod replicas.

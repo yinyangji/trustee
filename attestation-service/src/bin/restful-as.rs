@@ -16,7 +16,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt::Subscriber, EnvFilter};
 
-use crate::restful::{attestation, get_challenge, get_jwks, get_policies, set_policy};
+use crate::restful::{
+    attestation, get_challenge, get_jwks, get_policies, set_policy, signer_evidence,
+    signer_metadata,
+};
 
 mod restful;
 
@@ -43,6 +46,14 @@ pub struct Cli {
     /// private key are provided then HTTPS will be enabled.
     #[arg(short = 'k', long)]
     pub https_prikey: Option<String>,
+
+    /// Serve only the inference appraisal endpoint and health probes.
+    #[arg(long, requires_all = ["config_file", "https_pubkey_cert", "https_prikey"])]
+    pub inference_only: bool,
+
+    /// Maximum in-flight inference appraisals per replica.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=1024))]
+    pub inference_concurrency: u16,
 
     /// Allowed origin for CORS access (e.g., "http://localhost:3000")
     /// Can be specified multiple times or comma-separated
@@ -116,6 +127,28 @@ fn configure_cors(allowed_origin: &[String]) -> Cors {
     cors
 }
 
+fn configure_legacy(config: &mut web::ServiceConfig) {
+    config
+        .service(web::resource(WebApi::Attestation.as_ref()).route(web::post().to(attestation)))
+        .service(
+            web::resource(WebApi::Policy.as_ref())
+                .route(web::post().to(set_policy))
+                .route(web::get().to(get_policies)),
+        )
+        .service(web::resource(WebApi::Challenge.as_ref()).route(web::post().to(get_challenge)))
+        .service(web::resource(WebApi::Jwks.as_ref()).route(web::get().to(get_jwks)))
+        .service(
+            web::resource("/.well-known/attestation-configuration")
+                .route(web::get().to(signer_metadata)),
+        )
+        .service(
+            web::resource("/signer-evidence")
+                .app_data(web::JsonConfig::default().limit(1024))
+                .route(web::post().to(signer_evidence)),
+        )
+        .route("/healthz", web::get().to(HttpResponse::Ok));
+}
+
 #[actix_web::main]
 async fn main() -> Result<(), RestfulError> {
     let env_filter = match std::env::var_os("RUST_LOG") {
@@ -159,28 +192,38 @@ loglevel: {env_filter}
             Config::default()
         }
     };
-    debug!("Attestation Service config: {config:#?}");
+    if !cli.inference_only {
+        debug!("Attestation Service config: {config:#?}");
+    }
 
     let storage_provider =
         key_value_storage::KvStorageProvider::new(config.storage_backend.clone());
     let attestation_service = AttestationService::new(config, storage_provider).await?;
 
-    let allowed_origin = cli.allowed_origin.clone();
+    let inference = if cli.inference_only {
+        let endorsement = attestation_service.prepare_inference().await?;
+        Some(web::Data::new(restful::inference::InferenceState::new(
+            endorsement,
+            cli.inference_concurrency,
+        )))
+    } else {
+        None
+    };
 
+    let allowed_origin = cli.allowed_origin;
     let attestation_service = web::Data::new(Arc::new(RwLock::new(attestation_service)));
     let server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .wrap(configure_cors(&allowed_origin))
-            .service(web::resource(WebApi::Attestation.as_ref()).route(web::post().to(attestation)))
-            .service(
-                web::resource(WebApi::Policy.as_ref())
-                    .route(web::post().to(set_policy))
-                    .route(web::get().to(get_policies)),
-            )
-            .service(web::resource(WebApi::Challenge.as_ref()).route(web::post().to(get_challenge)))
-            .service(web::resource(WebApi::Jwks.as_ref()).route(web::get().to(get_jwks)))
-            .route("/healthz", web::get().to(HttpResponse::Ok))
-            .app_data(web::Data::clone(&attestation_service))
+            .app_data(web::Data::clone(&attestation_service));
+        if let Some(state) = &inference {
+            app = app
+                .app_data(web::Data::clone(state))
+                .configure(restful::inference::configure);
+        } else {
+            app = app.configure(configure_legacy);
+        }
+        app
     });
 
     let server = match (cli.https_prikey, cli.https_pubkey_cert) {
@@ -199,6 +242,7 @@ loglevel: {env_filter}
             builder
                 .set_certificate_chain_file(pubkey_cert)
                 .map_err(RestfulError::SetHttpsCert)?;
+            builder.check_private_key()?;
             info!("starting HTTPS server at https://{}", cli.socket);
             server.bind_openssl(cli.socket, builder)?.run()
         }

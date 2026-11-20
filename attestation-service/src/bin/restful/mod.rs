@@ -43,6 +43,38 @@ impl ResponseError for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+pub mod inference;
+
+pub async fn signer_metadata(cocoas: web::Data<Arc<RwLock<AttestationService>>>) -> HttpResponse {
+    match cocoas.read().await.get_signer_metadata() {
+        Ok(metadata) => HttpResponse::Ok().json(metadata),
+        Err(_) => HttpResponse::NotFound().finish(),
+    }
+}
+
+pub async fn signer_evidence(
+    request: web::Json<trustee_attested_signer::EvidenceRequest>,
+    cocoas: web::Data<Arc<RwLock<AttestationService>>>,
+) -> HttpResponse {
+    if request.validate().is_err() {
+        return HttpResponse::BadRequest().finish();
+    }
+    match cocoas
+        .read()
+        .await
+        .get_signer_evidence(request.into_inner())
+        .await
+    {
+        Ok(bundle) => HttpResponse::Ok()
+            .insert_header(("Cache-Control", "no-store"))
+            .json(bundle),
+        Err(error) => {
+            error!(%error, "Signer evidence unavailable");
+            HttpResponse::ServiceUnavailable().finish()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AttestationRequest {
     verification_requests: Vec<IndividualAttestationRequest>,
@@ -127,6 +159,50 @@ fn parse_init_data(data: InitDataInput) -> Result<InnerInitDataInput> {
     Ok(res)
 }
 
+impl TryFrom<IndividualAttestationRequest> for VerificationRequest {
+    type Error = Error;
+
+    fn try_from(request: IndividualAttestationRequest) -> Result<Self> {
+        let evidence = URL_SAFE_NO_PAD
+            .decode(&request.evidence)
+            .context("base64 decode evidence")?;
+
+        let evidence =
+            serde_json::from_slice(&evidence).context("failed to parse evidence as JSON")?;
+
+        let tee = to_tee(&request.tee)?;
+
+        let runtime_data = request
+            .runtime_data
+            .map(parse_runtime_data)
+            .transpose()
+            .context("decode given Runtime Data")?;
+
+        let init_data = request
+            .init_data
+            .map(parse_init_data)
+            .transpose()
+            .context("decode given Init Data")?;
+
+        let runtime_data_hash_algorithm = match request.runtime_data_hash_algorithm {
+            Some(alg) => HashAlgorithm::try_from(&alg[..])
+                .context("parse runtime data HashAlgorithm failed")?,
+            None => {
+                info!("No Runtime Data Hash Algorithm provided, use `sha384` by default.");
+                HashAlgorithm::Sha384
+            }
+        };
+
+        Ok(Self {
+            evidence,
+            tee,
+            runtime_data,
+            runtime_data_hash_algorithm,
+            init_data,
+        })
+    }
+}
+
 /// This handler uses json extractor
 #[instrument(skip_all, fields(request_id = tracing::field::Empty))]
 pub async fn attestation(
@@ -140,46 +216,11 @@ pub async fn attestation(
     let request = request.into_inner();
     debug!("attestation: {request:#?}");
 
-    let mut verification_requests: Vec<VerificationRequest> = vec![];
-    for attestation_request in request.verification_requests {
-        let evidence = URL_SAFE_NO_PAD
-            .decode(&attestation_request.evidence)
-            .context("base64 decode evidence")?;
-
-        let evidence =
-            serde_json::from_slice(&evidence).context("failed to parse evidence as JSON")?;
-
-        let tee = to_tee(&attestation_request.tee)?;
-
-        let runtime_data = attestation_request
-            .runtime_data
-            .map(parse_runtime_data)
-            .transpose()
-            .context("decode given Runtime Data")?;
-
-        let init_data = attestation_request
-            .init_data
-            .map(parse_init_data)
-            .transpose()
-            .context("decode given Init Data")?;
-
-        let runtime_data_hash_algorithm = match attestation_request.runtime_data_hash_algorithm {
-            Some(alg) => HashAlgorithm::try_from(&alg[..])
-                .context("parse runtime data HashAlgorithm failed")?,
-            None => {
-                info!("No Runtime Data Hash Algorithm provided, use `sha384` by default.");
-                HashAlgorithm::Sha384
-            }
-        };
-
-        verification_requests.push(VerificationRequest {
-            evidence,
-            tee,
-            runtime_data,
-            runtime_data_hash_algorithm,
-            init_data,
-        });
-    }
+    let verification_requests = request
+        .verification_requests
+        .into_iter()
+        .map(VerificationRequest::try_from)
+        .collect::<Result<Vec<_>>>()?;
 
     let policy_ids = if request.policy_ids.is_empty() {
         info!("no policy specified. `default` will be used");

@@ -33,6 +33,13 @@ pub fn manifest(
     }))?)
 }
 
+pub fn extend(initial: &[u8], content: &[u8]) -> Result<Vec<u8>> {
+    if initial.len() != 48 {
+        bail!("Initial RTMR[3] must contain exactly 48 bytes");
+    }
+    Ok(Sha384::digest([initial, Sha384::digest(content).as_slice()].concat()).to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,11 +74,4 @@ mod tests {
         assert!(manifest(files, true, &args, 0, 65534).is_err());
         assert!(extend(&[0; 47], &content).is_err());
     }
-}
-
-pub fn extend(initial: &[u8], content: &[u8]) -> Result<Vec<u8>> {
-    if initial.len() != 48 {
-        bail!("Initial RTMR[3] must contain exactly 48 bytes");
-    }
-    Ok(Sha384::digest([initial, Sha384::digest(content).as_slice()].concat()).to_vec())
 }

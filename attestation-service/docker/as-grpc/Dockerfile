@@ -8,6 +8,10 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} \
     AS builder
 ARG ARCH=x86_64
 ARG VERIFIER=all-verifier
+ARG ENABLE_INFERENCE=false
+ARG TRUSTEE_AS_BUILD_COMMIT
+ARG SOURCE_DATE_EPOCH
+ARG RELEASE_ELF_DIR=
 
 WORKDIR /usr/src/attestation-service
 COPY . .
@@ -33,7 +37,26 @@ RUN if [ "$(uname -m)" != "${ARCH}" ]; then \
     export RUSTFLAGS="${RUSTFLAGS_ARGS}"; \
     apt-get install -y ${GCC_PACKAGE}; \
     rustup target add ${RUSTC_TARGET}; fi; \
-    cargo install --path attestation-service --bin grpc-as --features grpc-bin,${VERIFIER} --locked ${TARGET_FLAG}
+    if [ -n "${RELEASE_ELF_DIR}" ]; then \
+        if [ "${ENABLE_INFERENCE}" != "true" ] || [ "${ARCH}" != "x86_64" ] || [ "${VERIFIER}" != "all-verifier" ]; then \
+            echo "Release ELF packaging requires the shared x86_64 inference profile" >&2; exit 1; \
+        fi; \
+        cd "${RELEASE_ELF_DIR}" && \
+        sha384sum grpc-as restful-as tdx-as-launch > /tmp/actual-as.sha384 && \
+        cmp expected-elf.sha384 /tmp/actual-as.sha384 && \
+        install -D -m 0755 -t /opt/as/bin grpc-as restful-as tdx-as-launch; \
+    elif [ "${ENABLE_INFERENCE}" = "true" ]; then \
+        if [ "${ARCH}" != "x86_64" ] || { [ "${VERIFIER}" != "all-verifier" ] && [ "${VERIFIER}" != "tdx-verifier" ]; }; then \
+            echo "ENABLE_INFERENCE requires x86_64 and a native TDX verifier" >&2; exit 1; \
+        fi; \
+        cargo install --root /opt/as --path attestation-service --bin grpc-as --bin restful-as \
+            --features "grpc-bin,restful-bin,tdx-self-attestation,${VERIFIER}" --locked ${TARGET_FLAG} && \
+        cargo install --root /opt/as --path tools/tdx-workload --bin tdx-as-launch \
+            --features as-launch --locked ${TARGET_FLAG}; \
+    else \
+        cargo install --root /opt/as --path attestation-service --bin grpc-as \
+            --features "grpc-bin,${VERIFIER}" --locked ${TARGET_FLAG}; \
+    fi
 
 # ubuntu:24.04
 FROM ubuntu@sha256:7c06e91f61fa88c08cc74f7e1b7c69ae24910d745357e0dfe1d2c0322aaf20f9
@@ -68,7 +91,7 @@ RUN if [ "${VERIFIER}" = "all-verifier" ] || [ "${VERIFIER}" = "az-snp-vtpm-veri
     apt-get clean && \
     rm -rf /var/lib/apt/lists/{apt,dpkg,cache,log} /tmp/* /var/tmp/*; fi
 
-COPY --from=builder /usr/local/cargo/bin/grpc-as /usr/local/bin/grpc-as
+COPY --from=builder /opt/as/bin/ /usr/local/bin/
 
 VOLUME /opt/confidential-containers/attestation-service
 

@@ -1,0 +1,15 @@
+{
+  "audience": "customer-inference",
+  "nonce": "<client-generated-32-random-bytes-as-lowercase-hex>",
+  "session_id": "<client-generated-32-random-bytes-as-lowercase-hex>",
+  "recipient_jwk": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "<actual-inference-recipient-x-base64url>",
+    "y": "<actual-inference-recipient-y-base64url>"
+  },
+  "policy_hashes": {
+    "default": "<approved-default_cpu-policy-SHA384>",
+    "application": "<approved-application_cpu-policy-SHA384>"
+  }
+}

@@ -578,3 +578,15 @@ items:
   - key: {{ include "coco-trustee.userKeysSecretDataKey.tokenCertChain" . }}
     path: token-cert-chain.pem
 {{- end }}
+
+{{- define "coco-trustee.as.image" -}}
+{{- $image := .Values.as.image -}}
+{{- if $image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $image.digest) -}}
+{{- fail "as.image.digest must be a lowercase sha256 digest" -}}
+{{- end -}}
+{{- printf "%s@%s" $image.repository $image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $image.repository $image.tag -}}
+{{- end -}}
+{{- end -}}

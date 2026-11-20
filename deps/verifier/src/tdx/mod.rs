@@ -99,7 +99,12 @@ async fn verify_evidence(
     )
     .await?;
 
-    let custom_claims = ecdsa_quote_verification(quote_bin.as_slice(), Some(collateral))?;
+    let quote_for_dcap = quote_bin.clone();
+    let custom_claims = tokio::task::spawn_blocking(move || {
+        ecdsa_quote_verification(&quote_for_dcap, Some(collateral))
+    })
+    .await
+    .context("DCAP verification worker failed")??;
 
     info!("Quote DCAP check succeeded.");
 

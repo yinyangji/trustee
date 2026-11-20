@@ -1,0 +1,18 @@
+{
+  "issuer": "https://as.example.com",
+  "releases": [{
+    "as_release_manifest_digest": "<approved-AS-release-manifest-SHA256>",
+    "mr_td": "<approved-AS-MRTD>",
+    "mr_config_id": "<approved-AS-restrictive-InitData-hash>",
+    "rtmr_0": "<approved-AS-RTMR0>",
+    "rtmr_1": "<approved-AS-RTMR1>",
+    "rtmr_2": "<approved-AS-RTMR2>",
+    "rtmr_3": "<approved-AS-executable-and-dependencies-RTMR3>",
+    "xfam": "<approved-AS-XFAM>",
+    "td_attributes": "<approved-AS-TDATTRIBUTES>"
+  }],
+  "governance_profile_digests": ["<customer-approved-governance-SHA256>"],
+  "allowed_tcb_statuses": ["UpToDate"],
+  "expires_at": 0,
+  "revoked_kids": []
+}

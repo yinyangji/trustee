@@ -41,6 +41,8 @@ pub struct EarAttestationTokenBroker {
     cert_url: Option<String>,
     cert_chain: Option<Vec<X509>>,
     policy_engine: PolicyEngine<Regorus>,
+    /// Bound local Quote work independently of the service's read lock.
+    signer_evidence_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl EarAttestationTokenBroker {
@@ -48,6 +50,18 @@ impl EarAttestationTokenBroker {
         config: EarTokenConfiguration,
         storage: KeyValueStorageInstance,
     ) -> Result<Self> {
+        if let Some(profile) = &config.self_attestation {
+            if !cfg!(feature = "tdx-self-attestation") {
+                bail!("Self-attestation requires the tdx-self-attestation build feature");
+            }
+            profile.validate(&config.issuer_name)?;
+            if config.signer.is_some()
+                || config.cc_ai.is_some()
+                || !(1..=5).contains(&config.duration_min)
+            {
+                bail!("Self-attestation requires an ephemeral signer, a 1..=5 minute lifetime, and no legacy CC-AI job profile");
+            }
+        }
         if let Some(trust) = &config.cc_ai {
             trust.validate()?;
         }
@@ -87,12 +101,14 @@ impl EarAttestationTokenBroker {
 
         if config.signer.is_none() {
             info!("No Token Signer key in config file, create an ephemeral key and without CA pubkey cert");
+            let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
             return Ok(Self {
-                private_key: generate_ec_keys()?.0,
+                private_key: EcKey::generate(&group)?,
                 config,
                 cert_url: None,
                 cert_chain: None,
                 policy_engine,
+                signer_evidence_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             });
         }
 
@@ -126,6 +142,7 @@ impl EarAttestationTokenBroker {
             cert_url: signer.cert_url,
             cert_chain,
             policy_engine,
+            signer_evidence_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 }
@@ -147,12 +164,43 @@ pub struct EvaluationResult {
 }
 
 impl EarAttestationTokenBroker {
-    pub async fn issue(
+    pub(crate) async fn issue(
         &self,
         all_tee_claims: Vec<TeeClaims>,
         policy_ids: Vec<String>,
         rvps_client: Option<RvpsClient>,
     ) -> Result<String> {
+        self.issue_with_profile(all_tee_claims, policy_ids, rvps_client, false)
+            .await
+    }
+
+    pub(crate) async fn issue_inference(&self, tee_claims: Vec<TeeClaims>) -> Result<String> {
+        self.issue_with_profile(
+            tee_claims,
+            vec!["default".into(), "application".into()],
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn issue_with_profile(
+        &self,
+        all_tee_claims: Vec<TeeClaims>,
+        policy_ids: Vec<String>,
+        rvps_client: Option<RvpsClient>,
+        inference: bool,
+    ) -> Result<String> {
+        if let Some(profile) = &self.config.self_attestation {
+            profile.governance.validate()?;
+            if all_tee_claims.is_empty()
+                || all_tee_claims
+                    .iter()
+                    .any(|c| matches!(c.tee, Tee::Sample | Tee::SampleDevice))
+            {
+                bail!("Attested signing requires verified evidence");
+            }
+        }
         if policy_ids.len() > 16 {
             bail!("At most 16 attestation policies may be evaluated per request");
         }
@@ -190,6 +238,14 @@ impl EarAttestationTokenBroker {
                     .evaluate_policy(&actual_id, &tcb_claims_json, &rvps_client)
                     .await
                     .with_context(|| format!("Evaluate policy {actual_id}"))?;
+                if let Some(profile) = &self.config.self_attestation {
+                    if profile.governance.policy_hashes.get(&actual_id) != Some(&hash)
+                        || evaluated.status != ear::TrustTier::Affirming
+                    {
+                        warn!(policy_id = %actual_id, policy_hash = %hash, status = %evaluated.status.as_str(), "Attested signer refused policy result");
+                        bail!("Attested signer rejected unapproved or non-affirming policy {actual_id}");
+                    }
+                }
                 results.push(json!({
                     "policy_id": id, "policy_hash": hash,
                     "trust_claims": evaluated.trust_vector,
@@ -213,7 +269,7 @@ impl EarAttestationTokenBroker {
                     }
                 }
             }
-            if policy_ids.len() > 1 {
+            if policy_ids.len() > 1 || self.config.self_attestation.is_some() {
                 let value: RawValue = serde_json::from_value(json!(results))?;
                 appraisal
                     .extensions
@@ -222,7 +278,16 @@ impl EarAttestationTokenBroker {
                     .extensions
                     .set_by_name("ear.trustee.policy-results", value)?;
             }
-            appraisal.annotated_evidence = tcb_claims;
+            if inference {
+                let runtime = tcb_claims
+                    .get("runtime_data_claims")
+                    .cloned()
+                    .context("missing verified inference runtime data")?;
+                appraisal.annotated_evidence =
+                    BTreeMap::from([("runtime_data_claims".into(), runtime)]);
+            } else {
+                appraisal.annotated_evidence = tcb_claims;
+            }
             appraisal.policy_id = Some(policy_ids[0].clone());
             appraisal.update_status_from_trust_vector();
 
@@ -252,6 +317,24 @@ impl EarAttestationTokenBroker {
 
         extensions.register("iss", 1, RawValueKind::String)?;
         extensions.set_by_name("iss", RawValue::String(self.config.issuer_name.clone()))?;
+
+        if let Some(profile) = &self.config.self_attestation {
+            if submods
+                .values()
+                .any(|appraisal| appraisal.status != ear::TrustTier::Affirming)
+            {
+                bail!("Attested signer refuses non-affirming appraisals");
+            }
+            exp = exp.min(OffsetDateTime::from_unix_timestamp(
+                profile.governance.expires_at,
+            )?);
+            extensions.set_by_name("exp", RawValue::Integer(exp.unix_timestamp()))?;
+            extensions.register("ear.trustee.signer-governance", -712, RawValueKind::String)?;
+            extensions.set_by_name(
+                "ear.trustee.signer-governance",
+                RawValue::String(profile.governance.digest()?),
+            )?;
+        }
 
         // Only verifier-derived InitData can opt into the job profile.
         let claims = json!({"submods": submods});
@@ -322,11 +405,22 @@ impl EarAttestationTokenBroker {
 
         let mut jwt_header = ear::new_jwt_header(&Algorithm::ES256)?;
         jwt_header.jwk = Some(self.pubkey_jwk()?);
+        jwt_header.kid = self.signer_kid()?;
 
         let pkey = PKey::from_ec_key(self.private_key.clone())?;
-        let private_key_bytes = pkey.private_key_to_pem_pkcs8()?;
+        let private_key_bytes = zeroize::Zeroizing::new(pkey.private_key_to_pem_pkcs8()?);
+
+        if let Some(profile) = &self.config.self_attestation {
+            profile.governance.validate()?;
+            if exp <= OffsetDateTime::now_utc() {
+                bail!("Attested signer refuses an already expired result");
+            }
+        }
 
         let signed_ear = ear.sign_jwt_pem_with_header(&jwt_header, &private_key_bytes)?;
+        if let Some(profile) = &self.config.self_attestation {
+            info!(kid = ?jwt_header.kid, governance_digest = %profile.governance.digest()?, policies = ?policy_ids, "Attested passport issued");
+        }
 
         Ok(signed_ear)
     }
@@ -339,8 +433,13 @@ impl EarAttestationTokenBroker {
     ) -> Result<(Appraisal, String)> {
         let mut appraisal = Appraisal::new();
         let mut extensions = vec![];
-        if let Some(ref rvps_client) = rvps_client {
+        if rvps_client.is_some() || self.config.self_attestation.is_some() {
             let rvps_client = rvps_client.clone();
+            let snapshot = self
+                .config
+                .self_attestation
+                .as_ref()
+                .map(|p| p.governance.reference_values.clone());
             let extension = RegorusExtension {
                 name: "query_reference_value".to_string(),
                 id: 1,
@@ -352,8 +451,14 @@ impl EarAttestationTokenBroker {
                         .as_string()
                         .context("query_reference_value extension parameter must be a string")?
                         .to_string();
+                    if let Some(snapshot) = &snapshot {
+                        let value = snapshot.get(&id).with_context(|| {
+                            format!("Reference {id} is not in the approved snapshot")
+                        })?;
+                        return serde_json::from_value(value.clone()).map_err(Error::from);
+                    }
                     debug!("query reference value from RVPS: {id}");
-                    let rvps_client = rvps_client.clone();
+                    let rvps_client = rvps_client.clone().context("RVPS client unavailable")?;
                     let reference_value_id = params[0].as_string()?.to_string();
                     // Policy evaluation runs on tokio's blocking pool, so it is
                     // safe to block_on the RVPS query here without starving
@@ -468,6 +573,9 @@ impl EarAttestationTokenBroker {
     }
 
     pub async fn set_policy(&self, policy_id: String, policy: String) -> Result<()> {
+        if self.config.self_attestation.is_some() {
+            bail!("Attested signer policies are immutable; publish a new approved governance snapshot");
+        }
         self.policy_engine
             .set_policy(&policy_id, &policy, true)
             .await
@@ -496,6 +604,143 @@ impl EarAttestationTokenBroker {
 }
 
 impl EarAttestationTokenBroker {
+    fn signing_key(&self) -> Result<trustee_attested_signer::SigningKey> {
+        let private = PKey::from_ec_key(self.private_key.clone())?;
+        let public = PKey::public_key_from_der(&private.public_key_to_der()?)?;
+        Ok(trustee_attested_signer::SigningKey::from_key(&public)?)
+    }
+
+    fn signer_kid(&self) -> Result<Option<String>> {
+        self.config
+            .self_attestation
+            .as_ref()
+            .map(|_| self.signing_key()?.kid().map_err(Error::from))
+            .transpose()
+    }
+
+    /// Evidence for this instance's actual signing key. Callers cannot supply
+    /// a replacement key, a REPORTDATA value, or a digest of different inputs.
+    pub async fn signer_evidence(
+        &self,
+        request: trustee_attested_signer::EvidenceRequest,
+    ) -> Result<trustee_attested_signer::SignerEvidenceBundle> {
+        request.validate()?;
+        let profile = self
+            .config
+            .self_attestation
+            .as_ref()
+            .context("AS self-attestation is disabled")?;
+        profile.governance.validate()?;
+        let signing_key = self.signing_key()?;
+        let kid = signing_key.kid()?;
+        if request.kid != kid {
+            bail!("Requested signer is not active on this instance");
+        }
+        let binding = trustee_attested_signer::Binding {
+            domain: trustee_attested_signer::DOMAIN.into(),
+            issuer: self.config.issuer_name.clone(),
+            kid: kid.clone(),
+            instance_id: kid.clone(),
+            signing_spki_sha256: kid,
+            as_release_manifest_digest: profile.as_release_manifest_digest.clone(),
+            governance_profile_digest: profile.governance.digest()?,
+            verifier_nonce: request.nonce,
+        };
+        let evidence = self.native_signer_evidence(binding.report_data()?).await?;
+        Ok(trustee_attested_signer::SignerEvidenceBundle {
+            binding,
+            signing_key,
+            evidence,
+        })
+    }
+
+    pub(crate) async fn inference_endorsement(
+        &self,
+    ) -> Result<trustee_attested_signer::inference::SignerEndorsement> {
+        use sha2::{Digest, Sha384};
+        use trustee_attested_signer::inference::{
+            require_tdx_evidence, EndorsementBinding, SignerEndorsement, ENDORSEMENT_DOMAIN,
+        };
+
+        let profile =
+            self.config.self_attestation.as_ref().context(
+                "Inference requires an ephemeral attested signer and approved governance",
+            )?;
+        profile.governance.validate()?;
+        for id in ["default_cpu", "application_cpu"] {
+            let policy = self.policy_engine.get_policy(id).await?;
+            let digest = hex::encode(Sha384::digest(policy.as_bytes()));
+            if profile.governance.policy_hashes.get(id) != Some(&digest) {
+                bail!("Inference policy {id} does not match the approved snapshot");
+            }
+        }
+
+        let signing_key = self.signing_key()?;
+        let kid = signing_key.kid()?;
+        let binding = EndorsementBinding {
+            domain: ENDORSEMENT_DOMAIN.into(),
+            issuer: self.config.issuer_name.clone(),
+            kid: kid.clone(),
+            instance_id: kid.clone(),
+            signing_spki_sha256: kid,
+            as_release_manifest_digest: profile.as_release_manifest_digest.clone(),
+            governance_profile_digest: profile.governance.digest()?,
+        };
+        let evidence = self.native_signer_evidence(binding.report_data()?).await?;
+        require_tdx_evidence(&evidence)?;
+        profile.governance.validate()?;
+
+        Ok(SignerEndorsement {
+            binding,
+            signing_key,
+            evidence,
+        })
+    }
+
+    async fn native_signer_evidence(&self, report_data: Vec<u8>) -> Result<Value> {
+        let permit = self
+            .signer_evidence_slot
+            .clone()
+            .try_acquire_owned()
+            .context("AS signer evidence capacity reached")?;
+        #[cfg(feature = "tdx-self-attestation")]
+        {
+            use attester::Attester;
+
+            // Cancellation/timeout must not release capacity while native
+            // Quote generation is still running in the guest.
+            let runtime = tokio::runtime::Handle::current();
+            let generation = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                runtime.block_on(attester::tdx::TdxAttester::new().get_evidence(report_data))
+            });
+            tokio::time::timeout(Duration::from_secs(30), generation)
+                .await
+                .context("AS Quote generation timed out")?
+                .context("AS Quote generation task failed")?
+        }
+        #[cfg(not(feature = "tdx-self-attestation"))]
+        {
+            let _ = (report_data, permit);
+            bail!("This build has no TDX self-attester")
+        }
+    }
+
+    pub fn signer_metadata(&self) -> Result<Value> {
+        self.config
+            .self_attestation
+            .as_ref()
+            .context("AS self-attestation is disabled")?;
+        let issuer = &self.config.issuer_name;
+        Ok(json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+            "signer_evidence_endpoint": format!("{issuer}/signer-evidence"),
+            "signer_binding_profile": trustee_attested_signer::DOMAIN,
+            "signing_algorithms_supported": ["ES256"],
+        }))
+    }
+
     fn pubkey_jwk(&self) -> Result<jwk::Jwk> {
         let chain = self
             .cert_chain
@@ -511,6 +756,7 @@ impl EarAttestationTokenBroker {
             .transpose()?;
 
         let common = jwk::CommonParameters {
+            key_id: self.signer_kid()?,
             key_algorithm: Some(jwk::KeyAlgorithm::ES256),
             x509_url: self.cert_url.clone(),
             x509_chain: chain,
@@ -541,6 +787,7 @@ impl EarAttestationTokenBroker {
     }
 }
 
+#[cfg(test)]
 fn generate_ec_keys() -> Result<(EcKey<Private>, Vec<u8>, Vec<u8>)> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
     let ec_key = EcKey::generate(&group)?;
@@ -617,6 +864,9 @@ mod cc_ai_tests {
             .public_key_to_pem()
             .unwrap();
         let claims = trustee_cc_ai::verify_pinned_result(&token, &pem).unwrap();
+        // Issuance can cross a Unix-second boundary after fixture creation.
+        // Verify against the current clock, never the earlier fixture time.
+        let now = OffsetDateTime::now_utc().unix_timestamp();
         assert!(claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap() <= 120);
         common::data_policy(trust.clone())
             .authorize(&claims, "workload/data/v1", now)

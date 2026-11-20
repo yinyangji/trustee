@@ -623,6 +623,7 @@ dependencies = [
  "anyhow",
  "assert-json-diff",
  "async-trait",
+ "attester",
  "axum",
  "base64 0.23.1",
  "cfg-if",
@@ -638,6 +639,7 @@ dependencies = [
  "prost",
  "reference-value-provider-service",
  "regorus",
+ "reqwest 0.13.4",
  "rsa",
  "rstest",
  "rustls",
@@ -661,6 +663,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "trustee-attested-signer",
  "trustee-cc-ai",
  "trustee-platform-api",
  "uuid",
@@ -7772,6 +7775,7 @@ checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 name = "tdx-workload"
 version = "0.1.0"
 dependencies = [
+ "actix-web",
  "anyhow",
  "attester",
  "base64 0.23.1",
@@ -7779,12 +7783,15 @@ dependencies = [
  "hex",
  "kbs_protocol",
  "libc",
+ "openssl",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "trustee-attested-signer",
 ]
 
 [[package]]
@@ -8277,6 +8284,34 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "trustee-attested-signer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "hex",
+ "http-body-util",
+ "hyper 1.10.1",
+ "hyper-util",
+ "jsonwebtoken",
+ "kbs-types 0.18.0",
+ "key-value-storage",
+ "openssl",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-openssl",
+ "url",
+ "verifier",
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ use attestation_service::{
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -387,6 +387,8 @@ pub async fn start(
         .await;
 
     let jwks_server = attestation_server.clone();
+    let signer_server = attestation_server.clone();
+    let metadata_server = attestation_server.clone();
     let base_routes = {
         let mut routes_builder = Routes::builder();
         routes_builder
@@ -397,6 +399,57 @@ pub async fn start(
     };
     let routes = {
         let mut router = base_routes.into_axum_router();
+        router = router.route(
+            "/.well-known/attestation-configuration",
+            get(move || {
+                let server = metadata_server.clone();
+                async move {
+                    match server
+                        .read()
+                        .await
+                        .attestation_service
+                        .get_signer_metadata()
+                    {
+                        Ok(metadata) => Json(metadata).into_response(),
+                        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        router = router.route(
+            "/signer-evidence",
+            post(
+                move |Json(request): Json<trustee_attested_signer::EvidenceRequest>| {
+                    let server = signer_server.clone();
+                    async move {
+                        if request.validate().is_err() {
+                            return (StatusCode::BAD_REQUEST, "invalid signer challenge")
+                                .into_response();
+                        }
+                        match server
+                            .read()
+                            .await
+                            .attestation_service
+                            .get_signer_evidence(request)
+                            .await
+                        {
+                            Ok(bundle) => {
+                                ([("cache-control", "no-store")], Json(bundle)).into_response()
+                            }
+                            Err(error) => {
+                                warn!(%error, "Signer evidence unavailable");
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "signer evidence unavailable",
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }
+                },
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(1024)),
+        );
         router = router.route(
             "/.well-known/jwks.json",
             get(move || {

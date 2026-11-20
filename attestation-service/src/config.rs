@@ -98,6 +98,7 @@ mod tests {
             profile_name: "tag:github.com,2024:confidential-containers/Trustee".into(),
             verbose_token: true,
             cc_ai: None,
+            self_attestation: None,
         },
         verifier_config: None,
         storage_backend: StorageBackendConfig {
@@ -122,6 +123,7 @@ mod tests {
             profile_name: "tag:github.com,2024:confidential-containers/Trustee".into(),
             verbose_token: true,
             cc_ai: None,
+            self_attestation: None,
             signer: Some(TokenSignerConfig {
                 protected_key: None,
                 key_path: "/etc/key".into(),

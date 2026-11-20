@@ -1,0 +1,24 @@
+{
+  "attestation_token_broker": {
+    "issuer_name": "https://as.example.com",
+    "duration_min": 5,
+    "self_attestation": {
+      "as_release_manifest_digest": "<approved-AS-release-manifest-SHA256>",
+      "governance": {
+        "policy_hashes": {
+          "default_cpu": "<SHA384-of-exact-default-policy-source>",
+          "application_cpu": "<SHA384-of-exact-application-policy-source>"
+        },
+        "reference_values": {
+          "mr_td": ["<approved-workload-MRTD>"],
+          "rtmr_1": ["<approved-workload-kernel-measurement>"],
+          "rtmr_2": ["<approved-workload-cmdline-measurement>"],
+          "xfam": ["<approved-workload-XFAM>"],
+          "application_rtmr_3": ["<approved-workload-application-measurement>"],
+          "application_init_data": ["<approved-restrictive-workload-InitData-hash>"]
+        },
+        "expires_at": 0
+      }
+    }
+  }
+}

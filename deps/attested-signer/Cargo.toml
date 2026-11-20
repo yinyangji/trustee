@@ -1,0 +1,50 @@
+[package]
+name = "trustee-attested-signer"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+tdx-verifier = ["dep:verifier", "verifier/tdx-verifier", "dep:key-value-storage", "dep:kbs-types", "dep:tokio"]
+cli = ["tdx-verifier", "dep:anyhow", "dep:clap", "dep:reqwest", "dep:tokio"]
+inference-cli = ["cli", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-openssl"]
+
+[[bin]]
+name = "verify-inference"
+required-features = ["inference-cli"]
+
+[[bin]]
+name = "verify-as-passport"
+required-features = ["cli"]
+
+[[bin]]
+name = "as-governance-digest"
+required-features = ["cli"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+base64.workspace = true
+clap = { workspace = true, optional = true }
+hex.workspace = true
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tokio-openssl = { version = "0.6", optional = true }
+jsonwebtoken.workspace = true
+openssl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_canonicalizer = "0.3"
+sha2.workspace = true
+thiserror.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
+url = "2"
+reqwest = { workspace = true, features = ["rustls"], optional = true }
+tokio = { workspace = true, optional = true }
+verifier = { path = "../verifier", default-features = false, optional = true }
+key-value-storage = { path = "../key-value-storage", optional = true }
+kbs-types = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

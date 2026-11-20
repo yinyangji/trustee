@@ -127,6 +127,26 @@ pub struct AttestationService {
     storage_provider: Arc<dyn StorageProvider>,
 }
 
+fn verify_inference_tdx_claims(
+    tee: Tee,
+    claims: &[(TeeEvidenceParsedClaim, TeeClass)],
+) -> Result<()> {
+    let [(claim, class)] = claims else {
+        bail!("Inference requires exactly one verified CPU report");
+    };
+    if tee != Tee::Tdx
+        || class != "cpu"
+        || claim
+            .pointer("/td_attributes/debug")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || claim["collateral_expiration_status"].as_str() != Some("0")
+    {
+        bail!("Inference requires native, non-debug TDX with valid collateral");
+    }
+    Ok(())
+}
+
 impl AttestationService {
     /// Create a new Attestation Service instance.
     ///
@@ -201,6 +221,66 @@ impl AttestationService {
             .context("Cannot Get Token Signer JWK Set")
     }
 
+    pub async fn get_signer_evidence(
+        &self,
+        request: trustee_attested_signer::EvidenceRequest,
+    ) -> Result<trustee_attested_signer::SignerEvidenceBundle> {
+        self.token_broker.signer_evidence(request).await
+    }
+
+    /// Called once before the inference-only HTTP listener is published.
+    pub async fn prepare_inference(
+        &self,
+    ) -> Result<trustee_attested_signer::inference::SignerEndorsement> {
+        if !cfg!(any(feature = "tdx-verifier", feature = "all-verifier")) {
+            bail!("Inference requires the native TDX verifier");
+        }
+        if self.config.storage_backend.storage_type
+            != key_value_storage::KeyValueStorageType::Memory
+            || self.config.rvps_config != rvps::RvpsConfig::default()
+        {
+            bail!("Inference requires local policy storage and its own governance snapshot");
+        }
+        let endorsement = self.token_broker.inference_endorsement().await?;
+        let verifier = verifier::to_verifier(
+            &Tee::Tdx,
+            self.config.verifier_config.clone(),
+            self.storage_provider.clone(),
+        )
+        .await?;
+        let claims = verifier
+            .evaluate(
+                endorsement.evidence.clone(),
+                &ReportData::Value(&endorsement.binding.report_data()?),
+                &InitDataHash::NotProvided,
+            )
+            .await
+            .context("verify this instance's signer Quote and CCEL before readiness")?;
+        verify_inference_tdx_claims(Tee::Tdx, &claims)?;
+        let rtmr3 = claims[0]
+            .0
+            .pointer("/quote/body/rtmr_3")
+            .and_then(Value::as_str);
+        if !rtmr3.is_some_and(|digest| digest.len() == 96 && digest.bytes().any(|b| b != b'0')) {
+            bail!("AS ELF measurement is missing");
+        }
+        Ok(endorsement)
+    }
+
+    pub fn inference_ready(&self) -> bool {
+        self.config
+            .attestation_token_broker
+            .self_attestation
+            .as_ref()
+            .is_some_and(|p| {
+                trustee_attested_signer::unix_time().is_ok_and(|now| now < p.governance.expires_at)
+            })
+    }
+
+    pub fn get_signer_metadata(&self) -> Result<Value> {
+        self.token_broker.signer_metadata()
+    }
+
     /// Evaluate Attestation Evidence.
     /// Issue an attestation results token which contain TCB status and TEE public key.
     /// An evaluation can cover one more pieces of TEE Evidence which represent the TCB.
@@ -211,6 +291,24 @@ impl AttestationService {
         verification_requests: Vec<VerificationRequest>,
         policy_ids: Vec<String>,
     ) -> Result<String> {
+        self.evaluate_with_profile(verification_requests, policy_ids, false)
+            .await
+    }
+
+    pub async fn evaluate_inference(&self, request: VerificationRequest) -> Result<String> {
+        if !self.inference_ready() {
+            bail!("Inference governance unavailable");
+        }
+        self.evaluate_with_profile(vec![request], Vec::new(), true)
+            .await
+    }
+
+    async fn evaluate_with_profile(
+        &self,
+        verification_requests: Vec<VerificationRequest>,
+        policy_ids: Vec<String>,
+        inference: bool,
+    ) -> Result<String> {
         let mut tee_claims: Vec<TeeClaims> = vec![];
 
         if verification_requests.is_empty() {
@@ -220,7 +318,7 @@ impl AttestationService {
         for verification_request in verification_requests {
             let verifier = verifier::to_verifier(
                 &verification_request.tee,
-                self.config.clone().verifier_config,
+                self.config.verifier_config.clone(),
                 self.storage_provider.clone(),
             )
             .await?;
@@ -249,6 +347,10 @@ impl AttestationService {
                 .await
                 .map_err(|e| anyhow!("Verifier evaluate failed: {e:?}"))?;
 
+            if inference {
+                verify_inference_tdx_claims(verification_request.tee, &claims)?;
+            }
+
             for (claims_from_tee_evidence, tee_class) in claims {
                 info!(
                     tee =? verification_request.tee,
@@ -256,12 +358,14 @@ impl AttestationService {
                     "Verifier/endorsement check passed.",
                 );
 
-                debug!(
-                    "claims = {}, initdata claims = {}, runtime claims = {}",
-                    serde_json::to_string(&claims_from_tee_evidence)?,
-                    serde_json::to_string(&init_data_claims)?,
-                    serde_json::to_string(&runtime_data_claims)?,
-                );
+                if !inference {
+                    debug!(
+                        "claims = {}, initdata claims = {}, runtime claims = {}",
+                        serde_json::to_string(&claims_from_tee_evidence)?,
+                        serde_json::to_string(&init_data_claims)?,
+                        serde_json::to_string(&runtime_data_claims)?,
+                    );
+                }
                 tee_claims.push(TeeClaims {
                     tee: verification_request.tee,
                     tee_class,
@@ -272,11 +376,12 @@ impl AttestationService {
             }
         }
 
-        let attestation_results_token = self
-            .token_broker
+        if inference {
+            return self.token_broker.issue_inference(tee_claims).await;
+        }
+        self.token_broker
             .issue(tee_claims, policy_ids, Some(self.rvps.clone()))
-            .await?;
-        Ok(attestation_results_token)
+            .await
     }
 
     /// Register a new reference value
@@ -326,7 +431,7 @@ impl AttestationService {
     ) -> Result<String> {
         let verifier = verifier::to_verifier(
             &tee,
-            self.config.clone().verifier_config,
+            self.config.verifier_config.clone(),
             self.storage_provider.clone(),
         )
         .await?;

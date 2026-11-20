@@ -14,6 +14,7 @@ members = [
     "deps/policy-engine",
     "deps/platform-api",
     "deps/cc-ai",
+    "deps/attested-signer",
 ]
 resolver = "2"
 

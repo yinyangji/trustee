@@ -1,11 +1,9 @@
 //! Measure immutable executable/script snapshots, attest, retrieve a resource,
 //! and execute those same snapshots. Linux native TDX only.
 use anyhow::{bail, Context, Result};
-use attester::{tdx::TdxAttester, Attester};
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+#[cfg(feature = "integration-test")]
+use base64::engine::general_purpose::STANDARD;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use clap::Parser;
 use kbs_protocol::keypair::TeeKeyPair;
 use serde_json::{json, Value};
@@ -24,8 +22,9 @@ use std::{
 };
 
 mod measurement;
+use tdx_workload::tdx_evidence;
 
-const REGISTER: &str = "/sys/devices/virtual/misc/tdx_guest/measurements/rtmr3:sha384";
+use tdx_evidence::RTMR3 as REGISTER;
 
 #[derive(Parser)]
 struct Args {
@@ -224,18 +223,6 @@ fn workload_command(snapshots: &[Snapshot], args: &Args, resource: &File) -> Res
     Ok(command)
 }
 
-fn tcg_event(content: &[u8]) -> Vec<u8> {
-    let mut event = vec![];
-    event.extend(4u32.to_le_bytes()); // TDX RTMR[3] maps to CC measurement register 4.
-    event.extend(5u32.to_le_bytes()); // EV_ACTION; UTF-8 JSON manifest.
-    event.extend(1u32.to_le_bytes());
-    event.extend(0xcu16.to_le_bytes()); // SHA-384
-    event.extend(Sha384::digest(content));
-    event.extend((content.len() as u32).to_le_bytes());
-    event.extend(content);
-    event
-}
-
 async fn checked(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
     let body = response.text().await?;
@@ -339,7 +326,7 @@ async fn main() -> Result<()> {
                 "expected_rtmr_3": hex::encode(final_value)
             }))?,
         )?;
-        Some(tcg_event(&content))
+        Some(tdx_evidence::tcg_event(&content))
     };
     if let Some(ref event) = event {
         let mut writer = &journal_file;
@@ -354,11 +341,7 @@ async fn main() -> Result<()> {
     if let Some(selector) = args.selector.as_ref().filter(|value| !value.is_empty()) {
         params["attestation-policy-selector"] = json!(selector);
     }
-    insert_passport(
-        &mut params,
-        &args.passport_audience,
-        &args.passport_nonce,
-    )?;
+    insert_passport(&mut params, &args.passport_audience, &args.passport_nonce)?;
     let challenge = checked(
         client
             .post(format!("{}/kbs/v0/auth", args.url))
@@ -383,38 +366,17 @@ async fn main() -> Result<()> {
     );
     let report_data =
         Sha384::digest(serde_json_canonicalizer::to_vec(&primary_runtime_data)?).to_vec();
-    let mut evidence = TdxAttester::new().get_evidence(report_data).await?;
-    if let Some(event) = event {
-        let encoded = evidence["cc_eventlog"]
-            .as_str()
-            .context("A boot event log is required for measured workloads")?;
-        let mut log = STANDARD.decode(encoded)?;
-        if !log.ends_with(&[0xff; 8]) {
-            bail!("Unexpected CC event log terminator");
-        }
-        log.truncate(log.len() - 8);
-        log.extend(&previous);
-        log.extend(&event);
-        log.extend([0xff; 8]);
-        evidence["cc_eventlog"] = json!(STANDARD.encode(log));
-    } else {
-        if !previous.is_empty() {
-            let mut log =
-                STANDARD.decode(evidence["cc_eventlog"].as_str().context("Missing CCEL")?)?;
-            if !log.ends_with(&[0xff; 8]) {
-                bail!("Unexpected CC event log terminator");
-            }
-            log.truncate(log.len() - 8);
-            log.extend(&previous);
-            log.extend([0xff; 8]);
-            evidence["cc_eventlog"] = json!(STANDARD.encode(log));
-        }
-    }
+    previous.extend(event.into_iter().flatten());
+    let evidence = tdx_evidence::collect(report_data, &previous).await?;
+    #[cfg(feature = "integration-test")]
+    let mut evidence = evidence;
     #[cfg(feature = "integration-test")]
     if args.corrupt_quote {
         let encoded = evidence["quote"].as_str().context("Missing quote")?;
         let mut quote = STANDARD.decode(encoded)?;
-        if quote.len() <= 600 { bail!("Quote is too short for the corruption test"); }
+        if quote.len() <= 600 {
+            bail!("Quote is too short for the corruption test");
+        }
         // Alter the signed TDX report body while preserving its wire encoding.
         quote[600] ^= 1;
         evidence["quote"] = json!(STANDARD.encode(quote));
@@ -493,7 +455,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["passport-audience"], "model-kms");
-        let plain = bind_passport_audience(json!({"nonce": "n", "additional-evidence": "{}"}), &None);
+        let plain =
+            bind_passport_audience(json!({"nonce": "n", "additional-evidence": "{}"}), &None);
         assert!(plain.get("audience").is_none());
         let bound = bind_passport_audience(plain, &Some("data-kms".into()));
         assert_eq!(bound["audience"], "data-kms");
@@ -634,7 +597,7 @@ mod tests {
         ])
         .unwrap();
         let encoded = manifest(&[measured], &args).unwrap();
-        let event = tcg_event(&encoded);
+        let event = tdx_evidence::tcg_event(&encoded);
         assert_eq!(&event[14..62], Sha384::digest(&encoded).as_slice());
         assert_eq!(&event[66..], encoded.as_slice());
     }

@@ -219,3 +219,77 @@ RESTful CoCo-AS's endpoints are as following:
     ]
 }
 ```
+
+
+## Inference background check
+
+Build the REST service with `restful-bin,tdx-verifier,tdx-self-attestation` and
+start it with `--inference-only` and a TLS certificate/key. Set
+`storage_backend.storage_type` to `Memory`, leave `rvps_config` at its default,
+set the HTTPS `attestation_token_broker.issuer_name`, and populate
+`attestation_token_broker.self_attestation` with the AS release manifest digest
+and the approved governance snapshot. The policy hashes are the SHA-384 of the
+exact built-in `ear_default_policy_cpu.rego` and
+`ear_application_policy_cpu.rego` bytes. Their snapshot IDs are `default_cpu`
+and `application_cpu`. Include all the reference values used by both policies.
+The launcher verifies the mounted release files and writes the RTMR3 event
+before executing the server. The approved InitData must bind the actual launcher,
+immutable filesystem, launch arguments, and restrictive agent policy.
+
+The inference listener exposes `POST /v1/verify`, `/readyz` and `/healthz`.
+A request contains `attestation_request` in the usual REST wire format, with
+one native TDX report and both `default` and `application` policies. Use
+SHA-384 structured runtime data with `profile` set to
+`coco.inference-background-check.v1`. It includes `audience`, `release_id`,
+`nonce`, `session_id` and `tls_spki_sha256`. Also supply the approved InitData
+TOML and the complete CCEL. An optional `known_signer_kids` array lets the
+selected replica omit its endorsement when the client has a valid cached copy.
+A successful result is a JSON object with `ear` and optional
+`signer_evidence`. Clients must verify both the signer and the fresh EAR
+against local trust and the actual inference connection.
+
+Build the guest tools and client with the following commands.
+
+```bash
+cargo build --locked -p tdx-workload --features as-launch,inference-guest --bins
+cargo build --locked -p trustee-attested-signer --features inference-cli --bins
+```
+
+Run `tdx-inference-guest` in the measured guest. Its backend must listen only on
+the same guest's loopback interface and provide `GET /health` for readiness. Supply the guest's own certificate and key,
+tenant API token, measured workload event journal, approved application RTMR3,
+audience and release ID. The client obtains evidence and sends the optional
+OpenAI-compatible request on a single pinned HTTPS connection.
+
+```bash
+verify-inference --trust signer-trust.json --release inference-release.json \
+  --init-data approved-initdata.toml --token-file tenant-token \
+  --prompt-request request.json
+```
+
+The local inference release file contains `audience` (the HTTPS origin),
+`release_id`, `as_release_manifest_digest`, `governance_digest`, and
+`policy_hashes` keyed by the wire policy IDs `default` and `application`.
+Use `as-governance-digest --config <approved-config.json>` to calculate the
+governance digest. The client accepts optional pinned `--guest-ca` and
+`--as-ca` roots for private PKIs. The inference endpoint currently implements
+the CPU plus application measurement profile. GPU evidence requires its own
+combined appraisal profile.
+
+The Trustee chart enables the separate deployment through `verifyAs.enabled`.
+It uses the same `as.image.digest` as deployment AS, with
+`--build-arg ENABLE_INFERENCE=true` in the gRPC image recipe. Provide the
+native TDX runtime class, configuration/TLS/launch secrets, approved starting
+RTMR3, and the launch-policy annotations. The launch Secret contains
+`manifest.json` with profile `trustee.as-elf-load.v1`, the approved
+`as_release_manifest_digest`, and a `files` array with `role`, canonical
+absolute `path`, `size`, and `sha384` for each file. Use role
+`restful-as` for the executable. Use `tdx-as-launch --print-measurement` to
+compute the expected RTMR3 from the approved manifest.
+
+For repeatable release binaries, run `hack/rebuild-as.sh` with the verified
+source bundle, vendored Cargo inputs, published builder digest, commit, and
+commit timestamp. The generated `expected-elf.sha384` covers all three
+binaries. The shared Dockerfile can package these exact outputs with
+`--build-arg ENABLE_INFERENCE=true --build-arg RELEASE_ELF_DIR=<context-path>`
+after the release pipeline has verified the signed input and output manifests.

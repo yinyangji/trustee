@@ -8,6 +8,9 @@ use serde::Deserialize;
 pub mod broker;
 pub use broker::EarAttestationTokenBroker;
 
+#[cfg(test)]
+mod attested_signer_tests;
+
 /// default token duration in minutes
 pub const DEFAULT_TOKEN_DURATION: i64 = 5;
 
@@ -75,6 +78,8 @@ pub struct EarTokenConfiguration {
     pub verbose_token: bool,
     /// Optional three-party job contract trust roots.
     pub cc_ai: Option<trustee_cc_ai::TrustPolicy>,
+    /// Opt-in TDX-backed ephemeral signer and immutable appraisal inputs.
+    pub self_attestation: Option<trustee_attested_signer::SignerConfig>,
 }
 
 #[inline]
@@ -93,6 +98,7 @@ impl Default for EarTokenConfiguration {
             signer: None,
             verbose_token: default_verbose_token(),
             cc_ai: None,
+            self_attestation: None,
         }
     }
 }

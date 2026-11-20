@@ -46,7 +46,7 @@ spec:
         - name: as
           securityContext:
             {{- include "coco-trustee.containerSecurityContext" . | nindent 12 }}
-          image: "{{ .Values.as.image.repository }}:{{ .Values.as.image.tag }}"
+          image: {{ include "coco-trustee.as.image" . | quote }}
           imagePullPolicy: {{ .Values.as.image.pullPolicy }}
           command:
             - "grpc-as"
