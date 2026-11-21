@@ -221,6 +221,11 @@ RESTful CoCo-AS's endpoints are as following:
 ```
 
 
+## Native TDX inference with a single policy
+
+The [single-policy profile](tdx-inference-policy.md) uses the standard
+`/attestation` endpoint for CPU and application measurements.
+
 ## Inference background check
 
 Build the REST service with `restful-bin,tdx-verifier,tdx-self-attestation` and
