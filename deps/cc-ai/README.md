@@ -6,6 +6,9 @@ GPU, distributed membership, checkpoint rollback protection, output enforcement
 and an attested TLS inference server are not implemented by this crate. Contracts
 requiring GPU or more than one member fail closed.
 
+See the [asset-owner passport design](../../docs/cc-ai-asset-owner-passport.md)
+for the independent model and data KMS flows and their deployment boundaries.
+
 ## Trust and topology: passport first
 
 The recommended model/data KMS integration is **Passport**: the workload obtains
