@@ -16,6 +16,27 @@ use sha2::{Digest, Sha384};
 
 pub const AUDIENCE_PARAM: &str = "passport-audience";
 pub const CHALLENGE_PARAM: &str = "passport-nonce";
+pub const SESSION_PARAM: &str = "passport-session-id";
+
+/// Optional client session identity, authenticated by the primary Quote rather
+/// than inferred from the KBS HTTP cookie. Existing passports remain unchanged.
+pub fn session_id(extra: &Value) -> Result<Option<String>> {
+    let Some(value) = extra.get(SESSION_PARAM) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .context("passport-session-id is not a string")?;
+    if PassportBinding::from_extra(extra)?.is_none()
+        || value.len() != 64
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        bail!("passport-session-id requires a passport audience/nonce and 32-byte lowercase hex");
+    }
+    Ok(Some(value.to_owned()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassportBinding {
@@ -49,6 +70,7 @@ impl PassportBinding {
 }
 
 pub fn bound_challenge(generated: &str, extra_params: &Value) -> Result<String> {
+    session_id(extra_params)?;
     Ok(match PassportBinding::from_extra(extra_params)? {
         Some(binding) => binding.challenge,
         None => generated.to_string(),
@@ -171,7 +193,7 @@ fn accept_trust_vector(cpu: &Value) -> Result<()> {
         .get("configuration")
         .and_then(Value::as_i64)
         .context("token has no configuration claim")?;
-    if !matches!(executables, 2 | 3 | 4) || hardware != 2 || !matches!(configuration, 2 | 3) {
+    if !matches!(executables, 2..=4) || hardware != 2 || !matches!(configuration, 2 | 3) {
         bail!("trustworthiness vector does not meet the workload minimum");
     }
     Ok(())
@@ -181,9 +203,19 @@ fn accept_launch_binding(evidence: &Value) -> Result<()> {
     if evidence.get("sample").is_some() || evidence.get("sample-device").is_some() {
         bail!("sample evidence cannot release a DEK");
     }
-    let native = ["tdx", "sgx", "snp", "csv", "cca", "se", "tpm", "az-tdx-vtpm", "az-snp-vtpm"]
-        .into_iter()
-        .any(|tee| evidence.get(tee).is_some_and(Value::is_object));
+    let native = [
+        "tdx",
+        "sgx",
+        "snp",
+        "csv",
+        "cca",
+        "se",
+        "tpm",
+        "az-tdx-vtpm",
+        "az-snp-vtpm",
+    ]
+    .into_iter()
+    .any(|tee| evidence.get(tee).is_some_and(Value::is_object));
     if !native {
         bail!("token has no native TEE evidence");
     }
@@ -238,9 +270,9 @@ fn validate_audience(audience: &str) -> Result<()> {
 fn validate_challenge(challenge: &str) -> Result<()> {
     let bytes = challenge.as_bytes();
     if (16..=128).contains(&bytes.len())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/' | b'-' | b'_' | b'='))
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/' | b'-' | b'_' | b'=')
+        })
     {
         Ok(())
     } else {
@@ -250,6 +282,30 @@ fn validate_challenge(challenge: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inference_session_requires_a_valid_passport_and_canonical_id() {
+        let valid = serde_json::json!({"passport-audience":"customer", "passport-nonce":"ab".repeat(32), "passport-session-id":"cd".repeat(32)});
+        assert_eq!(super::session_id(&valid).unwrap(), Some("cd".repeat(32)));
+        assert!(super::session_id(&serde_json::json!({})).unwrap().is_none());
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!("short"),
+            serde_json::json!("AB".repeat(32)),
+            serde_json::json!("f".repeat(65)),
+        ] {
+            let mut changed = valid.clone();
+            changed["passport-session-id"] = invalid;
+            assert!(super::bound_challenge("generated", &changed).is_err());
+        }
+        let mut changed = valid;
+        changed.as_object_mut().unwrap().remove("passport-audience");
+        assert!(super::bound_challenge("generated", &changed).is_err());
+        assert!(
+            super::session_id(&serde_json::json!({"passport-session-id":"ab".repeat(32)})).is_err()
+        );
+    }
+
     use super::*;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use josekit::jwe::{alg::ecdh_es::EcdhEsJweAlgorithm::EcdhEsA256kw, JweContext, JweHeaderSet};
@@ -341,10 +397,12 @@ mod tests {
         let mut header = JweHeaderSet::new();
         header.set_algorithm("ECDH-ES+A256KW", true);
         header.set_content_encryption("A256GCM", true);
-        let pem = private_key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let pem = private_key
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
         let (dek, _) = JweContext::new()
             .deserialize_json(
-                &serde_json::to_string(&wrapped).unwrap(),
+                serde_json::to_string(&wrapped).unwrap(),
                 &EcdhEsA256kw.decrypter_from_pem(&pem).unwrap(),
             )
             .unwrap();
@@ -424,12 +482,21 @@ mod tests {
         let (other_key, _) = tee_key();
         let runtime = runtime_data("data-challenge-01", &first_key, Some("data-kms"), "{}");
         let claims = workload_claims(&runtime, &report_hex(&runtime), "affirming");
-        assert!(release_error(claims.clone(), "data-kms", "other-challenge-1", &first_key).contains("challenge"));
-        assert!(release_error(claims.clone(), "data-kms", "data-challenge-01", &other_key).contains("public key"));
+        assert!(
+            release_error(claims.clone(), "data-kms", "other-challenge-1", &first_key)
+                .contains("challenge")
+        );
+        assert!(
+            release_error(claims.clone(), "data-kms", "data-challenge-01", &other_key)
+                .contains("public key")
+        );
         let mut unbound = claims.clone();
         unbound["submods"]["cpu0"]["ear.veraison.annotated-evidence"]["report_data"] =
             json!("00".repeat(64));
-        assert!(release_error(unbound, "data-kms", "data-challenge-01", &first_key).contains("report data"));
+        assert!(
+            release_error(unbound, "data-kms", "data-challenge-01", &first_key)
+                .contains("report data")
+        );
     }
 
     #[test]
@@ -439,7 +506,10 @@ mod tests {
         let mut boot_only = workload_claims(&runtime, &report_hex(&runtime), "affirming");
         boot_only["submods"]["cpu0"]["ear.trustee.policy-results"] =
             json!([{"policy_id": "default", "status": "affirming"}]);
-        assert!(release_error(boot_only, "data-kms", "data-challenge-01", &tee_key).contains("application"));
+        assert!(
+            release_error(boot_only, "data-kms", "data-challenge-01", &tee_key)
+                .contains("application")
+        );
 
         let mut unsafe_hardware = workload_claims(&runtime, &report_hex(&runtime), "affirming");
         unsafe_hardware["submods"]["cpu0"]["ear.trustworthiness-vector"]["hardware"] = json!(97);

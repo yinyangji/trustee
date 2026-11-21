@@ -7,10 +7,9 @@ wire protocol or an OIDC identity provider.
 
 The existing deployment path is unchanged: request `default` to evaluate
 `default_cpu` and release image keys. For inference sessions, request `default`
-and `application` together, evaluating `default_cpu` and `application_cpu`.
-The [inference background-check endpoint](../../attestation-service/docs/restful-as.md#inference-background-check)
-implements a separate protocol with reusable per-instance signer evidence and
-a fresh EAR for each TLS-bound inference request.
+and `application` together (KBS mode `workload`), evaluating `default_cpu` and
+`application_cpu`. A deployment-only passport cannot satisfy the application
+verifier in this crate.
 
 ## Trust chain
 
@@ -121,8 +120,8 @@ key, audience, and **both** expected policy hashes. These identifiers must be
 sent as structured, Quote-bound workload runtime data:
 
 SDK integrations can use `SessionExpectation::new` to generate independent
-cryptographic nonce/session IDs. The values must be included in the native
-workload Quote and supplied as structured runtime data to the AS.
+cryptographic nonce/session IDs, and `auth_extra_params()` to construct the
+CoCo `workload` handshake parameters.
 
 ```json
 {
@@ -133,12 +132,27 @@ workload Quote and supplied as structured runtime data to the AS.
 }
 ```
 
-Submit the structured runtime data with the workload's native Quote and
-launch-bound InitData to the standalone AS. An integration that transports
-these fields through KBS must preserve the nonce, audience and session ID
-in the auth transcript. The default image-key flow uses its own bootstrap
-and resource authorization. The inference service retains the recipient
-private key inside the approved guest.
+For the existing CoCo KBS handshake, send `passport-audience`, `passport-nonce`,
+and `passport-session-id` in the auth request's `extra-params`. KBS reconstructs
+these fields from the stored auth session when verifying the primary Quote;
+changing them afterwards breaks REPORTDATA verification. The TDX measurement
+tool supports the same fields:
+
+```sh
+tdx-workload --url "$KBS_URL" --selector workload \
+  --passport-audience customer-inference --passport-nonce "$CLIENT_NONCE" \
+  --passport-session-id "$CLIENT_SESSION_ID" --init-data init-data.toml \
+  --file /approved/inference-service --output-dir /run/inference-passport
+```
+
+Run the AS as a standalone service and configure KBS1 to use its gRPC API. The
+client fetches the AS proof directly from the fixed issuer. KBS's existing
+static-key RP helper does not automatically perform this bootstrap; customer
+SDKs or KBS2 integrations must use `VerifiedSigner` for this attested profile.
+The measurement tool demonstrates the attestation transcript; the command above
+does not launch a long-running inference service or retain its recipient key
+after the tool exits. A production inference endpoint must retain its own
+session key inside the approved domain and serve the bound inference session.
 
 The EAR profile checks audience in this authenticated runtime data, rather than
 requiring a top-level OIDC `aud`. An existing top-level audience cannot replace

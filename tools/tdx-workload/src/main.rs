@@ -40,6 +40,9 @@ struct Args {
     /// Challenge issued by the data or model KMS. KBS uses it as the attestation nonce.
     #[arg(long)]
     passport_nonce: Option<String>,
+    /// Client session ID included in the primary Quote's runtime data.
+    #[arg(long, requires_all = ["passport_audience", "passport_nonce"])]
+    passport_session_id: Option<String>,
     #[arg(long)]
     resource: Option<String>,
     /// Files in manifest order. The first is the executable, or script with --interpreter.
@@ -97,6 +100,20 @@ fn bind_passport_audience(mut runtime: Value, audience: &Option<String>) -> Valu
         runtime["audience"] = json!(audience);
     }
     runtime
+}
+
+fn insert_passport_session(params: &mut Value, session_id: &Option<String>) -> Result<()> {
+    if let Some(id) = session_id {
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            bail!("passport-session-id must be 32-byte lowercase hex");
+        }
+        params["passport-session-id"] = json!(id);
+    }
+    Ok(())
 }
 
 fn snapshot(path: &Path) -> Result<Snapshot> {
@@ -342,6 +359,7 @@ async fn main() -> Result<()> {
         params["attestation-policy-selector"] = json!(selector);
     }
     insert_passport(&mut params, &args.passport_audience, &args.passport_nonce)?;
+    insert_passport_session(&mut params, &args.passport_session_id)?;
     let challenge = checked(
         client
             .post(format!("{}/kbs/v0/auth", args.url))
@@ -357,13 +375,16 @@ async fn main() -> Result<()> {
     }
     let key = TeeKeyPair::new()?;
     let runtime_data = json!({"nonce":challenge["nonce"], "tee-pubkey":key.export_pubkey()?});
-    let primary_runtime_data = bind_passport_audience(
+    let mut primary_runtime_data = bind_passport_audience(
         json!({
             "nonce": challenge["nonce"], "tee-pubkey": runtime_data["tee-pubkey"],
             "additional-evidence": "{}",
         }),
         &args.passport_audience,
     );
+    if let Some(session_id) = &args.passport_session_id {
+        primary_runtime_data["session_id"] = json!(session_id);
+    }
     let report_data =
         Sha384::digest(serde_json_canonicalizer::to_vec(&primary_runtime_data)?).to_vec();
     previous.extend(event.into_iter().flatten());
@@ -442,6 +463,26 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_session_argument_requires_passport_and_canonical_id() {
+        let base = [
+            "tdx-workload",
+            "--url",
+            "http://kbs",
+            "--output-dir",
+            "/tmp/out",
+        ];
+        let mut args = base.to_vec();
+        args.extend(["--passport-session-id", "session-without-passport"]);
+        assert!(Args::try_parse_from(args).is_err());
+        let mut params = json!({});
+        insert_passport_session(&mut params, &Some("ab".repeat(32))).unwrap();
+        assert_eq!(params["passport-session-id"], "ab".repeat(32));
+        for id in ["short".into(), "AB".repeat(32), "g".repeat(64)] {
+            assert!(insert_passport_session(&mut params, &Some(id)).is_err());
+        }
+    }
 
     #[test]
     fn passport_audience_is_bound_into_the_quoted_runtime_data() {
