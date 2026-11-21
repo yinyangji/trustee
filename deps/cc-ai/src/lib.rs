@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha384};
 
+pub mod passport;
+
 pub const INIT_DATA_KEY: &str = "cc-ai.job";
 pub const AGENT_POLICY_DIGEST: &str = "cc-ai.agent-policy-sha384";
 pub const CLAIM: &str = "tag:github.com,2026:confidential-containers/cc-ai";

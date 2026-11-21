@@ -71,6 +71,22 @@ enum Command {
     },
     /// Print a fresh 256-bit nonce for a service passport request.
     Challenge,
+    /// Generate the signing identity INSIDE the trusted TEE, never on a host mount.
+    GeneratePopKey {
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+    },
+    /// Sign a KMS-issued scoped redemption challenge with the TEE's PoP key.
+    Proof {
+        #[arg(long)]
+        challenge: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 fn read<T: DeserializeOwned>(path: &PathBuf) -> Result<T> {
     let bytes = fs::read(path)?;
@@ -178,6 +194,35 @@ fn main() -> Result<()> {
                 now,
             )?;
             println!("{}", serde_json::to_string(&binding)?);
+        }
+        Command::GeneratePopKey {
+            private_key,
+            public_key,
+        } => {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+            let group = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)?;
+            let key = openssl::pkey::PKey::from_ec_key(openssl::ec::EcKey::generate(&group)?)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(private_key)?;
+            let pem = zeroize::Zeroizing::new(key.private_key_to_pem_pkcs8()?);
+            file.write_all(&pem)?;
+            save(
+                public_key,
+                &canonical(&public_jwk_from_pem(&key.public_key_to_pem()?)?)?,
+            )?;
+        }
+        Command::Proof {
+            challenge,
+            key,
+            output,
+        } => {
+            let challenge: passport::Challenge = read(&challenge)?;
+            let private = zeroize::Zeroizing::new(fs::read(key)?);
+            let proof = passport::sign_redemption(&challenge, &private, now)?;
+            save(output, proof.as_bytes())?;
         }
         Command::Challenge => {
             let mut nonce = [0u8; 32];

@@ -375,7 +375,7 @@ impl AttestationService {
         let attestation: Attestation = serde_json::from_slice(attestation)
             .inspect_err(|_| ATTESTATION_ERRORS.inc())
             .context("deserialize Attestation")?;
-        let (tee, nonce, passport_audience, passport_session_id) = {
+        let (tee, nonce, passport_audience, passport_pop_key, passport_session_id) = {
             let session = self
                 .session_map
                 .get(session_id)
@@ -421,6 +421,7 @@ impl AttestationService {
                 session.request().tee,
                 session.challenge().nonce.to_string(),
                 passport.map(|binding| binding.audience),
+                crate::passport::pop_key(&session.request().extra_params)?,
                 crate::passport::session_id(&session.request().extra_params)?,
             )
         };
@@ -442,6 +443,9 @@ impl AttestationService {
             passport_audience.as_deref(),
             &attestation.tee_evidence.additional_evidence,
         );
+        if let Some(key) = passport_pop_key {
+            primary_runtime_data[trustee_cc_ai::passport::POP_KEY] = key;
+        }
         if let Some(session_id) = passport_session_id {
             primary_runtime_data["session_id"] = json!(session_id);
         }

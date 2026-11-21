@@ -166,9 +166,16 @@ impl Attest for GrpcClientPool {
         tee_parameters: serde_json::Value,
     ) -> Result<Challenge> {
         let nonce = match tee {
-            Tee::Se => {
+            tee if tee == Tee::Se
+                || tee_parameters
+                    .get(trustee_cc_ai::passport::POP_KEY)
+                    .is_some() =>
+            {
                 let mut inner = HashMap::new();
-                inner.insert(String::from("tee"), String::from("se"));
+                inner.insert(
+                    String::from("tee"),
+                    serde_json::to_string(&tee)?.trim_matches('"').to_string(),
+                );
                 inner.insert(String::from("tee_params"), tee_parameters.to_string());
                 let req = tonic::Request::new(ChallengeRequest { inner });
 

@@ -6,26 +6,48 @@ GPU, distributed membership, checkpoint rollback protection, output enforcement
 and an attested TLS inference server are not implemented by this crate. Contracts
 requiring GPU or more than one member fail closed.
 
-## Trust and topology
+## Trust and topology: passport first
 
-Model/data key release uses **background check**: KBS supplies a nonce, forwards
-native evidence to AS, consumes the signed result and authorizes its own resource.
-Each asset owner configures its own contract authorities and resource policy.
-The CPU job profile refuses detached bearer-only resource requests and refuses
-client-selected passport nonces at those KBS endpoints.
+The recommended model/data KMS integration is **Passport**: the workload obtains
+an AS result, then presents it to each asset owner. Asset KMS request paths never
+call AS, RVPS or vendor collateral services and never interpret native evidence.
+`passport::AssetPassportVerifier` implements this boundary with a pinned AS key,
+an offline-approved job, per-request holder-of-key proof and one-use challenges.
 
-The user-side **passport** verifier checks a pinned AS P-256 signature, issuer,
-audience, age, the user's challenge, expected contract digest/job and connection
-public key. `verify-passport` is an offline verification tool, not a TLS stack:
-the caller must obtain `peer-key` from a TLS/application connection that has
-proved possession of its private key. Never copy the token's `cnf` into that
-argument and call it channel verification. The shared library API has the same
-precondition.
+A reusable stage passport uses separate quote-bound keys: `K_pop` signs resource
+redemptions, while `K_enc` receives encrypted keys. AS signs the normalized
+`cc-ai.passport.v1` claim and sets `cnf.jwk` to the PoP public key. The result's
+private recipient-key field and job digest bind the resource-encryption identity.
+Missing PoP claims or legacy EAR tokens are not silently accepted as this profile.
 
-The separately developed KBS passport gateway may forward proof acquisition to
-AS and return the result to a workload. For another RP that then consumes it,
-this is a combined RATS topology. It is not enabled as an alternative to the
-asset-owner KBS background-check requirement in this profile.
+The owner registers the three-party signed contract once with `RegisteredJob`.
+For each operation it calls `challenge`, verifies the returned proof through
+`redeem`, and only then calls its existing KMS to wrap the exact authorized
+resource to the returned recipient key. A valid passport may be reused during
+its allowed stage/age; challenges and proofs are always new. No challenge is
+consumed before successful proof validation, and concurrent redemption consumes
+it only once. The nonce cache is bounded, local and expiring: use shared atomic
+storage or appropriate routing when deploying multiple adapter replicas.
+
+The AS-proof acquisition frontend may be the existing platform KBS. This is a
+Verifier gateway, not the owner of the business DEKs; the asset-owner RP still
+uses Passport. `--passport-pop-public-key` adds a separate public PoP key to the
+quote-verified runtime data. The frontend requests an AS-issued challenge
+bound to that public key; AS consumes it once after successful appraisal.
+Old quote replay cannot mint a fresh reusable passport. Both issuer and RP
+challenge caches are currently single-instance; multi-replica deployments need
+shared atomic state or reliable session routing.
+
+For compatibility, the older KMS-nonce-in-quote passport path remains available.
+It needs fresh proof acquisition per independent KMS challenge and does not offer
+stage-token reuse. The previous owner-KBS `cc_ai` background-check resource path
+and `RelyingPartyPolicy::authorize` are retained as **legacy**, not the default
+passport adapter. Its background session guards are intentionally not relaxed.
+
+The older user-side `verify-passport` CLI validates a legacy service token and
+an independently authenticated peer key. It is not a TLS stack. The new reusable
+asset passport uses the `passport` module; these two profiles are not interchangeable.
+An attested TLS inference server and its transport SDK still require integration.
 
 ## Contract and evidence binding
 
@@ -53,18 +75,17 @@ snapshots, arguments and expected extension history. Register them in RVPS with
 the approved launch digest. Do not enroll a guest-supplied measurement as a
 reference. The existing `default` and `application` appraisals must both pass.
 
-The AS result includes the private claim
+The legacy AS job result includes the private claim
 `tag:github.com,2026:confidential-containers/cc-ai`, `aud` and normalized `cnf.jwk`.
 The claim binds contract digest, job/tenant, stage, nonce, key identity and policy
 epoch. Result expiry is capped at 120 seconds and contract expiry. No new field
 is asserted to be an upstream EAT/EAR standardized business claim.
 
-At resource release, KBS independently checks the role signatures and derives
-the same binding from AS-signed evidence, then checks the owner, exact resource,
-audience, issuer, time and stage. This runs before any resource backend and in
-addition to compiled minimum mode authorization and administrator Rego. A
-permissive custom Rego policy cannot bypass it. Configure authenticated admin
-access and pinned token roots; insecure embedded header-JWK trust is rejected.
+For the new passport, AS additionally emits
+`tag:github.com,2026:confidential-containers/cc-ai-passport` only when it verifies
+a distinct PoP key in native-bound runtime data. The asset adapter consumes that
+normalized claim, not InitData or EAR device paths. A permissive KMS resource
+policy cannot replace the owner's registered contract or proof validation.
 
 ## Configuration
 
@@ -82,7 +103,7 @@ AS: set `attestation_token_broker.cc_ai` to a `TrustPolicy` JSON object:
 }
 ```
 
-KBS: set top-level `cc_ai` to a `RelyingPartyPolicy`:
+Asset adapter: construct it with a `RelyingPartyPolicy` and pinned AS public key:
 
 ```json
 {
@@ -95,7 +116,9 @@ KBS: set top-level `cc_ai` to a `RelyingPartyPolicy`:
 ```
 
 The `trust` placeholder must be an object. Use `role: model` and a distinct
-audience for the model KBS. Changes to revoked jobs / minimum epoch currently
+audience for the model owner adapter. Supplying this object as a legacy KBS
+top-level `cc_ai` option selects its historical background-check gate, not the
+new standalone adapter; there is no automatic migration of an existing KMS. Changes to revoked jobs / minimum epoch currently
 require configuration reload by restarting the service. Legacy deployments with
 `cc_ai` absent retain their existing behavior; they do not enforce this profile.
 Production requires authenticated transport and the trust governance described
@@ -123,6 +146,35 @@ Key paths, not private key contents, appear in command arguments. Keep key files
 under each party's own controls. The CLI does not provision all party keys to a
 shared platform; the integration fixture does so only for synthetic testing.
 
+## Reusable passport API
+
+```rust,ignore
+use trustee_cc_ai::passport::{AssetPassportVerifier, RegisteredJob};
+let approved = RegisteredJob::new(signed_job, &owner_policy.trust, now)?;
+let verifier = AssetPassportVerifier::new(owner_policy, pinned_as_public_key)?;
+let challenge = verifier.challenge(&approved, &passport_token, resource, now)?;
+// The TEE signs the complete challenge using K_pop and sends proof_jws.
+let release = verifier.redeem(&approved, &passport_token,
+    &challenge.nonce, &proof_jws, now)?;
+// Call the owner's existing KMS/HSM only now, using release.resource() and
+// release.recipient_key(). Never return a plaintext key to the caller.
+```
+
+A trusted TEE proof service can use the provided CLI. Generate keys in a private
+TEE tmpfs, not on host mounts; prohibit untrusted programs from reading them:
+
+```sh
+cc-ai generate-pop-key --private-key /run/cc-ai/pop.pem --public-key /run/cc-ai/pop.json
+# Pass the public JSON into tdx-workload --passport-pop-public-key; keep the
+# private key in the approved TEE service. No private key is sent to AS/KMS.
+cc-ai proof --challenge kms-challenge.json --key /run/cc-ai/pop.pem --output proof.jws
+```
+
+This is a versioned ES256/JWS redemption protocol (`cc-ai-pop+jws`), not a claim
+of complete OAuth DPoP support. The proof binds resource, RP audience, contract,
+passport digest, timestamp and nonce. Trust configuration changes invalidate
+registered approvals. A stolen passport alone cannot sign a valid redemption.
+
 ## Verification
 
 ```sh
@@ -132,6 +184,11 @@ cargo +1.95.0 test -p attestation-service --no-default-features \
 cargo +1.95.0 test -p kbs --no-default-features --features coco-as-grpc --lib --locked --offline
 ```
 
-AS unit integration uses synthetic native-verifier output and real AS signatures;
-it does not validate a hardware quote. Real CPU TDX acceptance is documented by
-the separate CoCo `policy/cc-ai-20261115` harness and its recorded results.
+Tests cover normalized tokens without raw evidence, independent PoP/recipient
+keys, resource scope, repeated and concurrent replay, wrong signatures, expired
+challenges and approval changes. AS unit integration uses synthetic native-
+verifier outputs plus real signatures; it is not a hardware quote test. The old
+CoCo `policy/cc-ai-20261115` background suite is historical and incomplete; it is
+not validation of the new reusable passport profile. Real KMS backends, deployed
+TLS service identities and hardware end-to-end passport acceptance remain explicit
+integration work.

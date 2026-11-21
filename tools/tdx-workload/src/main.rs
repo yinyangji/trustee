@@ -43,6 +43,10 @@ struct Args {
     /// Client session ID included in the primary Quote's runtime data.
     #[arg(long, requires_all = ["passport_audience", "passport_nonce"])]
     passport_session_id: Option<String>,
+    /// Separate TEE-generated public PoP key for reusable stage passports.
+    /// The private key stays in the trusted workload's proof service.
+    #[arg(long, conflicts_with_all = ["passport_audience", "passport_nonce"])]
+    passport_pop_public_key: Option<PathBuf>,
     #[arg(long)]
     resource: Option<String>,
     /// Files in manifest order. The first is the executable, or script with --interpreter.
@@ -360,6 +364,16 @@ async fn main() -> Result<()> {
     }
     insert_passport(&mut params, &args.passport_audience, &args.passport_nonce)?;
     insert_passport_session(&mut params, &args.passport_session_id)?;
+    let pop_key = args
+        .passport_pop_public_key
+        .as_ref()
+        .map(|path| -> Result<Value> {
+            trustee_cc_ai::public_jwk(&serde_json::from_slice(&fs::read(path)?)?)
+        })
+        .transpose()?;
+    if let Some(key) = &pop_key {
+        params[trustee_cc_ai::passport::POP_KEY] = key.clone();
+    }
     let challenge = checked(
         client
             .post(format!("{}/kbs/v0/auth", args.url))
@@ -382,6 +396,9 @@ async fn main() -> Result<()> {
         }),
         &args.passport_audience,
     );
+    if let Some(key) = pop_key {
+        primary_runtime_data[trustee_cc_ai::passport::POP_KEY] = key;
+    }
     if let Some(session_id) = &args.passport_session_id {
         primary_runtime_data["session_id"] = json!(session_id);
     }

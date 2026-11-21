@@ -42,6 +42,9 @@ pub struct EarAttestationTokenBroker {
     cert_url: Option<String>,
     cert_chain: Option<Vec<X509>>,
     policy_engine: PolicyEngine<Regorus>,
+    /// Issuer-side freshness for reusable passports. A caller cannot refresh
+    /// an old quote merely by asking AS to sign it again.
+    passport_challenges: std::sync::Mutex<BTreeMap<String, (String, i64)>>,
     /// Bound local Quote work independently of the service's read lock.
     signer_evidence_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -66,6 +69,50 @@ impl AttestedGovernance {
 pub(crate) struct PolicyRejected(String);
 
 impl EarAttestationTokenBroker {
+    pub fn generate_passport_challenge(&self, key: &Value, now: i64) -> Result<String> {
+        self.config
+            .cc_ai
+            .as_ref()
+            .context("CC-AI passport trust is not configured")?;
+        let digest =
+            trustee_cc_ai::sha384(&trustee_cc_ai::canonical(&trustee_cc_ai::public_jwk(key)?)?);
+        let mut random = [0u8; 32];
+        openssl::rand::rand_bytes(&mut random)?;
+        let nonce = hex::encode(random);
+        let mut challenges = self
+            .passport_challenges
+            .lock()
+            .map_err(|_| anyhow!("AS challenge cache unavailable"))?;
+        challenges.retain(|_, (_, expiry)| *expiry > now);
+        if challenges.len() >= 4096 {
+            bail!("AS challenge capacity reached");
+        }
+        challenges.insert(
+            nonce.clone(),
+            (
+                digest,
+                now.checked_add(60).context("Challenge time overflow")?,
+            ),
+        );
+        Ok(nonce)
+    }
+
+    fn consume_passport_challenge(&self, nonce: &str, pop_key: &Value, now: i64) -> Result<()> {
+        let digest = trustee_cc_ai::sha384(&trustee_cc_ai::canonical(pop_key)?);
+        let mut challenges = self
+            .passport_challenges
+            .lock()
+            .map_err(|_| anyhow!("AS challenge cache unavailable"))?;
+        let (expected, expiry) = challenges
+            .get(nonce)
+            .context("AS passport challenge unknown or already consumed")?;
+        if *expiry <= now || *expected != digest {
+            bail!("AS passport challenge expired or key mismatch");
+        }
+        challenges.remove(nonce);
+        Ok(())
+    }
+
     pub async fn new(
         mut config: EarTokenConfiguration,
         storage: KeyValueStorageInstance,
@@ -136,6 +183,7 @@ impl EarAttestationTokenBroker {
                 cert_url: None,
                 cert_chain: None,
                 policy_engine,
+                passport_challenges: std::sync::Mutex::new(BTreeMap::new()),
                 signer_evidence_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             });
         }
@@ -171,6 +219,7 @@ impl EarAttestationTokenBroker {
             cert_url: signer.cert_url,
             cert_chain,
             policy_engine,
+            passport_challenges: std::sync::Mutex::new(BTreeMap::new()),
             signer_evidence_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
@@ -420,6 +469,23 @@ impl EarAttestationTokenBroker {
                 let raw: RawValue = serde_json::from_value(value)?;
                 extensions.register(name, key, raw.kind())?;
                 extensions.set_by_name(name, raw)?;
+            }
+            if evidence["runtime_data_claims"]
+                .get(trustee_cc_ai::passport::POP_KEY)
+                .is_some()
+            {
+                let passport =
+                    trustee_cc_ai::passport::from_verified_evidence(evidence, binding.clone())?;
+                self.consume_passport_challenge(
+                    &passport.job.nonce,
+                    &passport.pop_key,
+                    now.unix_timestamp(),
+                )?;
+                let cnf: RawValue = serde_json::from_value(json!({"jwk":passport.pop_key}))?;
+                extensions.set_by_name("cnf", cnf)?;
+                let raw: RawValue = serde_json::from_value(serde_json::to_value(passport)?)?;
+                extensions.register(trustee_cc_ai::passport::CLAIM, -711, raw.kind())?;
+                extensions.set_by_name(trustee_cc_ai::passport::CLAIM, raw)?;
             }
             exp =
                 exp.min(now + TimeDuration::seconds(120))
@@ -969,6 +1035,87 @@ mod cc_ai_tests {
                 None
             )
             .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn reusable_passport_has_separate_pop_and_recipient_and_local_owner_redemption() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (trust, signed, mut fixture) = common::fixture(now);
+        let e = &mut fixture["submods"]["cpu0"]["ear.veraison.annotated-evidence"];
+        let (_, pop_private, pop_public) = generate_ec_keys().unwrap();
+        e["runtime_data_claims"][trustee_cc_ai::passport::POP_KEY] =
+            trustee_cc_ai::public_jwk_from_pem(&pop_public).unwrap();
+        let broker = broker(trust.clone()).await;
+        let nonce = broker
+            .generate_passport_challenge(
+                &e["runtime_data_claims"][trustee_cc_ai::passport::POP_KEY],
+                now,
+            )
+            .unwrap();
+        e["runtime_data_claims"]["nonce"] = json!(nonce);
+        let token = broker
+            .issue(
+                vec![verified(e)],
+                vec!["default".into(), "application".into()],
+                None,
+            )
+            .await
+            .unwrap();
+        let as_public = PKey::from_ec_key(broker.private_key.clone())
+            .unwrap()
+            .public_key_to_pem()
+            .unwrap();
+        let rp = trustee_cc_ai::passport::AssetPassportVerifier::new(
+            common::data_policy(trust.clone()),
+            as_public,
+        )
+        .unwrap();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let job = trustee_cc_ai::passport::RegisteredJob::new(signed, &trust, now).unwrap();
+        let challenge = rp.challenge(&job, &token, "workload/data/v1", now).unwrap();
+        let proof =
+            trustee_cc_ai::passport::sign_redemption(&challenge, &pop_private, now).unwrap();
+        let grant = rp
+            .redeem(&job, &token, &challenge.nonce, &proof, now)
+            .unwrap();
+        assert_eq!(grant.resource(), "workload/data/v1");
+        // AS itself also refuses reissuing the same old native evidence as a
+        // fresh passport, independently of each KMS redemption nonce.
+        assert!(broker
+            .issue(
+                vec![verified(e)],
+                vec!["default".into(), "application".into()],
+                None
+            )
+            .await
+            .is_err());
+        assert!(rp
+            .redeem(&job, &token, &challenge.nonce, &proof, now)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn passport_issuer_nonce_expires_and_is_bound_to_pop_key() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (trust, _, _) = common::fixture(now);
+        let broker = broker(trust).await;
+        let (_, _, public) = generate_ec_keys().unwrap();
+        let key = trustee_cc_ai::public_jwk_from_pem(&public).unwrap();
+        let nonce = broker.generate_passport_challenge(&key, now).unwrap();
+        let (_, _, wrong) = generate_ec_keys().unwrap();
+        assert!(broker
+            .consume_passport_challenge(
+                &nonce,
+                &trustee_cc_ai::public_jwk_from_pem(&wrong).unwrap(),
+                now
+            )
+            .is_err());
+        assert!(broker
+            .consume_passport_challenge(&nonce, &key, now + 60)
+            .is_err());
+        assert!(broker
+            .consume_passport_challenge("caller-chosen-old-nonce", &key, now)
             .is_err());
     }
 }

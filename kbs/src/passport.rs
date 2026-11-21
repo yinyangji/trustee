@@ -38,6 +38,16 @@ pub fn session_id(extra: &Value) -> Result<Option<String>> {
     Ok(Some(value.to_owned()))
 }
 
+/// Optional separate PoP key for the reusable CC-AI passport. Taken from the
+/// auth session and included in the primary quote's runtime-data, not trusted
+/// merely because it appeared in HTTP input.
+pub fn pop_key(extra: &Value) -> Result<Option<Value>> {
+    extra
+        .get(trustee_cc_ai::passport::POP_KEY)
+        .map(trustee_cc_ai::public_jwk)
+        .transpose()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassportBinding {
     pub audience: String,

@@ -299,6 +299,17 @@ impl AttestationService {
         tee: Tee,
         tee_parameters: String,
     ) -> Result<String> {
+        if let Ok(params) = serde_json::from_str::<Value>(&tee_parameters) {
+            if let Some(key) = params.get(trustee_cc_ai::passport::POP_KEY) {
+                if tee != Tee::Tdx {
+                    bail!("Reusable CC-AI passport currently requires native TDX");
+                }
+                return self.token_broker.generate_passport_challenge(
+                    key,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                );
+            }
+        }
         let verifier = self.evidence_verifier.for_tee(&tee).await?;
         verifier
             .generate_supplemental_challenge(tee_parameters)

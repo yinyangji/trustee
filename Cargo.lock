@@ -7792,6 +7792,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "trustee-attested-signer",
+ "trustee-cc-ai",
 ]
 
 [[package]]
@@ -8330,6 +8331,7 @@ dependencies = [
  "tempfile",
  "time",
  "toml",
+ "zeroize",
 ]
 
 [[package]]

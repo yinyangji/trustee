@@ -119,7 +119,11 @@ impl Attest for BuiltInCoCoAs {
         tee_parameters: serde_json::Value,
     ) -> Result<Challenge> {
         let nonce = match tee {
-            Tee::Se => {
+            tee if tee == Tee::Se
+                || tee_parameters
+                    .get(trustee_cc_ai::passport::POP_KEY)
+                    .is_some() =>
+            {
                 self.inner
                     .read()
                     .await
